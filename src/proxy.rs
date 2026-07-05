@@ -1,14 +1,17 @@
 use std::{
+    collections::{HashMap, HashSet},
     fmt,
     net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow, bail};
 use shadowsocks::{ServerConfig, relay::socks5::Address as ShadowAddress};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HostPort {
@@ -83,6 +86,39 @@ impl ProxyNode {
             Self::Shadowsocks { label, .. } => label.clone(),
         }
     }
+
+    pub fn key(&self) -> String {
+        match self {
+            Self::Http { addr, auth } => format!("http://{}{}", auth_key(auth.as_ref()), addr),
+            Self::Socks5 {
+                addr,
+                auth,
+                remote_dns,
+            } => {
+                let scheme = if *remote_dns { "socks5h" } else { "socks5" };
+                format!("{scheme}://{}{}", auth_key(auth.as_ref()), addr)
+            }
+            Self::Socks4 {
+                addr,
+                auth,
+                remote_dns,
+            } => {
+                let scheme = if *remote_dns { "socks4a" } else { "socks4" };
+                format!("{scheme}://{}{}", auth_key(auth.as_ref()), addr)
+            }
+            Self::Shadowsocks { server, .. } => {
+                format!("ss://{}@{}", server.method(), server.addr())
+            }
+        }
+    }
+}
+
+fn auth_key(auth: Option<&Credentials>) -> String {
+    auth.map(|auth| {
+        let password = auth.password.as_deref().unwrap_or("");
+        format!("{}:{password}@", auth.username)
+    })
+    .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -151,47 +187,232 @@ impl fmt::Display for TargetAddr {
 #[derive(Debug, Clone)]
 pub enum ProxyChoice {
     Direct,
-    Proxy(ProxyNode),
+    Proxy(ProxyEntry),
 }
 
+impl ProxyChoice {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Direct => "direct".to_owned(),
+            Self::Proxy(entry) => entry.label.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyEntry {
+    pub key: String,
+    pub label: String,
+    pub node: ProxyNode,
+}
+
+impl ProxyEntry {
+    fn from_node(node: ProxyNode) -> Self {
+        Self {
+            key: node.key(),
+            label: node.label(),
+            node,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ProxyPool {
-    proxies: Arc<Vec<ProxyNode>>,
+    inner: Arc<ProxyPoolInner>,
+}
+
+#[derive(Debug)]
+struct ProxyPoolInner {
+    proxies: RwLock<Arc<Vec<ProxyEntry>>>,
     next: AtomicUsize,
     max_retries: usize,
+    runtime_failure_threshold: usize,
+    cooldown: Duration,
+    failures: Mutex<HashMap<String, FailureRecord>>,
+}
+
+#[derive(Debug, Clone)]
+struct FailureRecord {
+    failures: usize,
+    cooldown_until: Option<Instant>,
 }
 
 impl ProxyPool {
     pub fn new(proxies: Vec<ProxyNode>, max_retries: usize) -> Self {
+        Self::with_runtime_options(proxies, max_retries, 3, Duration::from_secs(300))
+    }
+
+    pub fn with_runtime_options(
+        proxies: Vec<ProxyNode>,
+        max_retries: usize,
+        runtime_failure_threshold: usize,
+        cooldown: Duration,
+    ) -> Self {
         Self {
-            proxies: Arc::new(proxies),
-            next: AtomicUsize::new(0),
-            max_retries: max_retries.max(1),
+            inner: Arc::new(ProxyPoolInner {
+                proxies: RwLock::new(Arc::new(entries_from_nodes(proxies))),
+                next: AtomicUsize::new(0),
+                max_retries: max_retries.max(1),
+                runtime_failure_threshold: runtime_failure_threshold.max(1),
+                cooldown,
+                failures: Mutex::new(HashMap::new()),
+            }),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.proxies.len()
+        self.snapshot().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.proxies.is_empty()
+        self.snapshot().is_empty()
+    }
+
+    pub fn replace(&self, proxies: Vec<ProxyNode>) {
+        let entries = entries_from_nodes(proxies);
+        let live_keys: HashSet<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+        let new_len = entries.len();
+        {
+            let mut guard = self
+                .inner
+                .proxies
+                .write()
+                .expect("proxy pool lock poisoned");
+            *guard = Arc::new(entries);
+        }
+        {
+            let mut failures = self
+                .inner
+                .failures
+                .lock()
+                .expect("proxy failure lock poisoned");
+            failures.retain(|key, _| live_keys.contains(key));
+        }
+        info!("active proxy pool swapped, active_nodes={new_len}");
     }
 
     pub fn candidates(&self) -> Vec<ProxyChoice> {
-        if self.proxies.is_empty() {
+        let proxies = self.snapshot();
+        if proxies.is_empty() {
             return vec![ProxyChoice::Direct];
         }
 
-        let len = self.proxies.len();
-        let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
-        let limit = self.max_retries.min(len);
-        (0..limit)
-            .map(|offset| {
-                let index = (start + offset) % len;
-                ProxyChoice::Proxy(self.proxies[index].clone())
-            })
-            .collect()
+        let len = proxies.len();
+        let start = self.inner.next.fetch_add(1, Ordering::Relaxed) % len;
+        let limit = self.inner.max_retries.min(len);
+        let now = Instant::now();
+        let mut failures = self
+            .inner
+            .failures
+            .lock()
+            .expect("proxy failure lock poisoned");
+        let mut choices = Vec::with_capacity(limit);
+
+        for offset in 0..len {
+            if choices.len() == limit {
+                break;
+            }
+            let entry = proxies[(start + offset) % len].clone();
+            if is_in_cooldown(&mut failures, &entry, now) {
+                continue;
+            }
+            choices.push(ProxyChoice::Proxy(entry));
+        }
+
+        choices
     }
+
+    pub fn report_success(&self, choice: &ProxyChoice) {
+        let ProxyChoice::Proxy(entry) = choice else {
+            return;
+        };
+        let mut failures = self
+            .inner
+            .failures
+            .lock()
+            .expect("proxy failure lock poisoned");
+        if failures.remove(&entry.key).is_some() {
+            debug!(node = %entry.label, "proxy runtime failure counter reset after success");
+        }
+    }
+
+    pub fn report_failure(&self, choice: &ProxyChoice) {
+        let ProxyChoice::Proxy(entry) = choice else {
+            return;
+        };
+        let now = Instant::now();
+        let mut failures = self
+            .inner
+            .failures
+            .lock()
+            .expect("proxy failure lock poisoned");
+        let record = failures.entry(entry.key.clone()).or_insert(FailureRecord {
+            failures: 0,
+            cooldown_until: None,
+        });
+        if record.cooldown_until.is_some_and(|until| until <= now) {
+            record.failures = 0;
+            record.cooldown_until = None;
+        }
+
+        record.failures += 1;
+        if record.failures >= self.inner.runtime_failure_threshold {
+            record.failures = 0;
+            record.cooldown_until = Some(now + self.inner.cooldown);
+            warn!(
+                node = %entry.label,
+                cooldown_seconds = self.inner.cooldown.as_secs(),
+                "proxy entered cooldown after repeated runtime failures"
+            );
+        } else {
+            warn!(
+                node = %entry.label,
+                failures = record.failures,
+                threshold = self.inner.runtime_failure_threshold,
+                "proxy runtime failure recorded"
+            );
+        }
+    }
+
+    fn snapshot(&self) -> Arc<Vec<ProxyEntry>> {
+        self.inner
+            .proxies
+            .read()
+            .expect("proxy pool lock poisoned")
+            .clone()
+    }
+}
+
+impl Clone for ProxyPool {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+fn entries_from_nodes(proxies: Vec<ProxyNode>) -> Vec<ProxyEntry> {
+    proxies.into_iter().map(ProxyEntry::from_node).collect()
+}
+
+fn is_in_cooldown(
+    failures: &mut HashMap<String, FailureRecord>,
+    entry: &ProxyEntry,
+    now: Instant,
+) -> bool {
+    let Some(record) = failures.get(&entry.key) else {
+        return false;
+    };
+    let Some(until) = record.cooldown_until else {
+        return false;
+    };
+    if until > now {
+        debug!(node = %entry.label, "skipping proxy in cooldown");
+        return true;
+    }
+    failures.remove(&entry.key);
+    debug!(node = %entry.label, "proxy cooldown expired");
+    false
 }
 
 #[cfg(test)]
@@ -227,7 +448,7 @@ mod tests {
             .into_iter()
             .map(|choice| match choice {
                 ProxyChoice::Direct => "direct".to_owned(),
-                ProxyChoice::Proxy(proxy) => proxy.label(),
+                ProxyChoice::Proxy(entry) => entry.label,
             })
             .collect();
         assert_eq!(labels, vec!["http://127.0.0.1:1", "http://127.0.0.1:2"]);
@@ -237,7 +458,7 @@ mod tests {
             .into_iter()
             .map(|choice| match choice {
                 ProxyChoice::Direct => "direct".to_owned(),
-                ProxyChoice::Proxy(proxy) => proxy.label(),
+                ProxyChoice::Proxy(entry) => entry.label,
             })
             .collect();
         assert_eq!(labels, vec!["http://127.0.0.1:2", "http://127.0.0.1:3"]);
@@ -247,5 +468,34 @@ mod tests {
     fn empty_pool_uses_direct() {
         let pool = ProxyPool::new(Vec::new(), 10);
         assert!(matches!(pool.candidates()[0], ProxyChoice::Direct));
+    }
+
+    #[test]
+    fn proxy_enters_and_leaves_cooldown() {
+        let pool =
+            ProxyPool::with_runtime_options(vec![http_proxy(1)], 1, 3, Duration::from_millis(30));
+        let choice = pool.candidates().pop().unwrap();
+        pool.report_failure(&choice);
+        assert_eq!(pool.candidates().len(), 1);
+        pool.report_failure(&choice);
+        assert_eq!(pool.candidates().len(), 1);
+        pool.report_failure(&choice);
+        assert!(pool.candidates().is_empty());
+
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(pool.candidates().len(), 1);
+    }
+
+    #[test]
+    fn replace_swaps_proxy_snapshot() {
+        let pool = ProxyPool::new(vec![http_proxy(1)], 1);
+        pool.replace(vec![http_proxy(2), http_proxy(3)]);
+        let labels: Vec<String> = pool
+            .candidates()
+            .into_iter()
+            .map(|choice| choice.label())
+            .collect();
+        assert_eq!(labels.len(), 1);
+        assert_ne!(labels[0], "http://127.0.0.1:1");
     }
 }

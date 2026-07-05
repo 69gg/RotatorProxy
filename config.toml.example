@@ -23,3 +23,27 @@ subscription_user_agent = "RotatorProxy/0.1"
 
 # Default log level. RUST_LOG overrides this value.
 log_level = "info"
+
+# HTTP endpoint used to test outbound proxy liveness.
+# Current health checks support http:// URLs. Pick an endpoint that is stable
+# and reachable from your network; any 2xx/3xx response is considered healthy.
+health_check_url = "http://example.com/"
+
+# A node must pass within this many attempts to enter the active rotation pool.
+health_check_attempts = 3
+
+# Timeout for each health-check attempt.
+health_check_timeout_ms = 10000
+
+# Maximum number of proxy nodes checked at the same time.
+health_check_concurrency = 32
+
+# Runtime connection failures before an active node enters cooldown.
+runtime_failure_threshold = 3
+
+# How long a runtime-failing node is skipped before it can be tried again.
+cooldown_seconds = 300
+
+# Local time for the daily full reload + health check.
+# The service keeps serving with the previous active pool until the new pool is ready.
+daily_refresh_time = "04:00"

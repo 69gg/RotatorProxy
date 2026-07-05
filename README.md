@@ -7,6 +7,9 @@ RotatorProxy is a single-port proxy rotator. It accepts HTTP proxy requests, HTT
 - Single listening port with automatic HTTP/SOCKS5 detection.
 - Round-robin outbound selection with low-contention atomic indexing.
 - Connection-setup retry across the next proxies in the pool; default is 10 attempts.
+- Startup full reload + batch health check before the service starts accepting traffic.
+- Daily scheduled full reload + batch health check with seamless active-pool swap.
+- Runtime cooldown: an active node is skipped temporarily after repeated connection failures.
 - Direct mode when the proxy pool is empty.
 - Outbound support for:
   - HTTP `CONNECT` proxies via `http://host:port`
@@ -22,7 +25,7 @@ cp config.toml.example config.toml
 cargo run --release -- --config config.toml
 ```
 
-Point an HTTP or SOCKS5 client at the configured `listen` address, for example `127.0.0.1:7890`.
+On startup, RotatorProxy first loads all configured sources and health-checks every parsed node. It starts listening only after that initial refresh finishes. Point an HTTP or SOCKS5 client at the configured `listen` address, for example `127.0.0.1:7890`.
 
 ## Configuration
 
@@ -35,6 +38,12 @@ See [config.toml.example](config.toml.example). The important fields are:
 - `subscription_timeout_ms`: timeout when fetching subscription URLs.
 - `subscription_user_agent`: User-Agent used for subscription HTTP requests.
 - `log_level`: default tracing level. `RUST_LOG` overrides it.
+- `health_check_url`: HTTP URL used for node liveness checks. Any 2xx/3xx response passes.
+- `health_check_attempts`: failed attempts before a node is excluded from the active pool.
+- `health_check_concurrency`: maximum concurrent health checks during a batch.
+- `runtime_failure_threshold`: runtime connection failures before an active node enters cooldown.
+- `cooldown_seconds`: duration for skipping a runtime-failing active node.
+- `daily_refresh_time`: local `HH:MM` time for the daily full source reload and health check.
 
 `config.toml` is intentionally ignored by Git.
 
@@ -80,9 +89,19 @@ proxies:
 
 Base64 subscriptions are supported when the entire fetched body or file content is a Base64-encoded text document. After decoding, RotatorProxy parses the decoded content as the same line-based or Clash YAML formats.
 
+## Refresh And Health Checks
+
+RotatorProxy does not watch input directories. It reloads files and subscription URLs only at startup and at the configured daily refresh time. Scheduled refreshes do not stop the service: the current active pool keeps serving while the new pool is downloaded and health-checked, then the active pool is swapped in one step.
+
+During batch health checks, a node that fails all configured attempts is not admitted to the active rotation pool. During normal traffic, if an admitted node fails connection setup repeatedly, it enters cooldown and is skipped until the cooldown expires.
+
+Logs include source reloads, subscription fetch failures, health-check admission/rejection, pool swaps, runtime failures, and cooldown transitions.
+
 ## Current Scope
 
 RotatorProxy is a TCP proxy rotator. It does not implement UDP associate, a Clash rules engine, VMess/Trojan/SSR/Hysteria transports, or HTTPS transport to an HTTP proxy. Unknown Clash proxy types are skipped with a warning.
+
+Health checks currently use an `http://` URL so they can run through every supported TCP proxy without adding a TLS client into the check path.
 
 For plain HTTP proxy requests, RotatorProxy rewrites the first absolute-form request line to origin-form and then tunnels the connection. `CONNECT` is the preferred mode for HTTPS traffic.
 
@@ -100,3 +119,4 @@ The integration tests cover:
 - HTTP `CONNECT` forwarding.
 - SOCKS5 inbound forwarding.
 - Retry from a failed outbound proxy to the next proxy.
+- Batch health refresh filtering and active-pool swap.

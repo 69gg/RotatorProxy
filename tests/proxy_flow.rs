@@ -1,6 +1,9 @@
-use std::{io, net::SocketAddr, time::Duration};
+use std::{fs, io, net::SocketAddr, time::Duration};
 
-use rotator_proxy::{HostPort, ProxyNode, ProxyPool, outbound::Connector, server::run_listener};
+use rotator_proxy::{
+    AppConfig, HostPort, ProxyNode, ProxyPool, health::refresh_proxy_pool, outbound::Connector,
+    server::run_listener,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream},
@@ -121,6 +124,13 @@ async fn unused_local_port() -> io::Result<u16> {
     Ok(port)
 }
 
+fn labels_from_pool(pool: &ProxyPool) -> Vec<String> {
+    pool.candidates()
+        .into_iter()
+        .map(|choice| choice.label())
+        .collect()
+}
+
 #[tokio::test]
 async fn forwards_absolute_form_http_request_directly() -> io::Result<()> {
     let (target_addr, first_line_rx, _target_handle) = spawn_http_target().await?;
@@ -228,5 +238,42 @@ async fn retries_next_proxy_when_first_proxy_fails() -> io::Result<()> {
     assert_eq!(&echoed, b"next");
 
     proxy_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_refresh_filters_failed_proxy_and_swaps_pool() -> io::Result<()> {
+    let bad_port = unused_local_port().await?;
+    let (target_addr, _first_line_rx, _target_handle) = spawn_http_target().await?;
+    let (good_proxy_addr, _good_proxy_handle) = spawn_http_connect_proxy().await?;
+
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!(
+            "http://127.0.0.1:{bad_port}\nhttp://127.0.0.1:{}\n",
+            good_proxy_addr.port()
+        ),
+    )
+    .unwrap();
+
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_url: format!("http://{target_addr}/health"),
+        health_check_attempts: 1,
+        health_check_timeout_ms: 500,
+        health_check_concurrency: 2,
+        ..AppConfig::default()
+    };
+    let pool = ProxyPool::with_runtime_options(Vec::new(), 2, 3, Duration::from_secs(60));
+    let summary = refresh_proxy_pool(&config, &pool, "test").await.unwrap();
+
+    assert_eq!(summary.loaded, 2);
+    assert_eq!(summary.active, 1);
+    assert_eq!(
+        labels_from_pool(&pool),
+        vec![format!("http://127.0.0.1:{}", good_proxy_addr.port())]
+    );
     Ok(())
 }

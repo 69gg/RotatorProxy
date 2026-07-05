@@ -146,12 +146,14 @@ async fn parse_content_queue(
 
         for url in parsed.subscription_urls {
             debug!("fetching subscription {url}");
-            let body = fetch_subscription(client, &url).await?;
-            queue.push_back(QueuedContent {
-                content: body,
-                source: url,
-                depth: item.depth + 1,
-            });
+            match fetch_subscription(client, &url).await {
+                Ok(body) => queue.push_back(QueuedContent {
+                    content: body,
+                    source: url,
+                    depth: item.depth + 1,
+                }),
+                Err(err) => warn!("failed to fetch subscription {url}: {err:#}"),
+            }
         }
     }
 

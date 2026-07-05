@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rotator_proxy::{
-    AppConfig, ProxyPool, config::config_path_from_args, load_proxies_from_dirs,
-    outbound::Connector, server,
+    AppConfig, ProxyPool, config::config_path_from_args, health, outbound::Connector, server,
 };
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -14,11 +13,25 @@ async fn main() -> Result<()> {
     let config = AppConfig::load(&config_path)?;
     init_logging(&config.log_level)?;
 
-    let proxies = load_proxies_from_dirs(&config).await?;
-    info!("loaded {} outbound proxies", proxies.len());
+    let pool = ProxyPool::with_runtime_options(
+        Vec::new(),
+        config.max_retries,
+        config.runtime_failure_threshold,
+        Duration::from_secs(config.cooldown_seconds),
+    );
+    info!("startup proxy refresh begins before service starts");
+    let summary = health::refresh_proxy_pool(&config, &pool, "startup").await?;
+    info!(
+        loaded_nodes = summary.loaded,
+        active_nodes = summary.active,
+        "startup proxy refresh finished; starting service"
+    );
 
-    let pool = ProxyPool::new(proxies, config.max_retries);
-    let connector = Connector::new(pool, Duration::from_millis(config.connect_timeout_ms));
+    let connector = Connector::new(
+        pool.clone(),
+        Duration::from_millis(config.connect_timeout_ms),
+    );
+    let _refresh_handle = health::spawn_daily_refresh(config.clone(), pool);
     server::run(&config.listen, connector)
         .await
         .with_context(|| format!("proxy server failed on {}", config.listen))

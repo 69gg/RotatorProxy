@@ -1,4 +1,5 @@
 pub mod config;
+pub mod health;
 pub mod outbound;
 pub mod parser;
 pub mod proxy;

@@ -51,15 +51,21 @@ impl Connector {
         let mut last_error = None;
 
         for choice in candidates {
-            let label = choice_label(&choice);
-            let attempt = timeout(self.connect_timeout, self.connect_once(choice, target)).await;
+            let label = choice.label();
+            let attempt = timeout(
+                self.connect_timeout,
+                self.connect_once(choice.clone(), target),
+            )
+            .await;
             match attempt {
                 Ok(Ok(stream)) => {
+                    self.pool.report_success(&choice);
                     debug!("connected to {target} via {label}");
                     return Ok(stream);
                 }
                 Ok(Err(err)) => {
                     warn!("failed to connect to {target} via {label}: {err}");
+                    self.pool.report_failure(&choice);
                     last_error = Some(err);
                 }
                 Err(_) => {
@@ -68,6 +74,7 @@ impl Connector {
                         format!("connect timeout after {:?}", self.connect_timeout),
                     );
                     warn!("failed to connect to {target} via {label}: {err}");
+                    self.pool.report_failure(&choice);
                     last_error = Some(err);
                 }
             }
@@ -83,38 +90,54 @@ impl Connector {
     ) -> io::Result<BoxedStream> {
         match choice {
             ProxyChoice::Direct => connect_direct(target).await,
-            ProxyChoice::Proxy(proxy) => match proxy {
-                ProxyNode::Http { addr, auth } => {
-                    connect_http_proxy(&addr, auth.as_ref(), target).await
-                }
-                ProxyNode::Socks5 {
-                    addr,
-                    auth,
-                    remote_dns,
-                } => connect_socks5_proxy(&addr, auth.as_ref(), remote_dns, target).await,
-                ProxyNode::Socks4 {
-                    addr,
-                    auth,
-                    remote_dns,
-                } => connect_socks4_proxy(&addr, auth.as_ref(), remote_dns, target).await,
-                ProxyNode::Shadowsocks { server, .. } => {
-                    let stream = ProxyClientStream::connect(
-                        self.ss_context.clone(),
-                        server.as_ref(),
-                        target.to_shadow_address(),
-                    )
-                    .await?;
-                    Ok(Box::new(stream))
-                }
-            },
+            ProxyChoice::Proxy(entry) => {
+                connect_proxy_node(&self.ss_context, entry.node, target).await
+            }
         }
     }
 }
 
-fn choice_label(choice: &ProxyChoice) -> String {
-    match choice {
-        ProxyChoice::Direct => "direct".to_owned(),
-        ProxyChoice::Proxy(proxy) => proxy.label(),
+pub async fn connect_via_proxy_node(
+    proxy: ProxyNode,
+    target: &TargetAddr,
+    connect_timeout: Duration,
+) -> io::Result<BoxedStream> {
+    let context = Context::new_shared(ServerType::Local);
+    match timeout(connect_timeout, connect_proxy_node(&context, proxy, target)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("connect timeout after {connect_timeout:?}"),
+        )),
+    }
+}
+
+async fn connect_proxy_node(
+    ss_context: &SharedContext,
+    proxy: ProxyNode,
+    target: &TargetAddr,
+) -> io::Result<BoxedStream> {
+    match proxy {
+        ProxyNode::Http { addr, auth } => connect_http_proxy(&addr, auth.as_ref(), target).await,
+        ProxyNode::Socks5 {
+            addr,
+            auth,
+            remote_dns,
+        } => connect_socks5_proxy(&addr, auth.as_ref(), remote_dns, target).await,
+        ProxyNode::Socks4 {
+            addr,
+            auth,
+            remote_dns,
+        } => connect_socks4_proxy(&addr, auth.as_ref(), remote_dns, target).await,
+        ProxyNode::Shadowsocks { server, .. } => {
+            let stream = ProxyClientStream::connect(
+                ss_context.clone(),
+                server.as_ref(),
+                target.to_shadow_address(),
+            )
+            .await?;
+            Ok(Box::new(stream))
+        }
     }
 }
 
