@@ -1,0 +1,25 @@
+# RotatorProxy example configuration.
+# Copy this file to config.toml and adjust values for your environment.
+
+# The single local proxy port. It auto-detects HTTP/HTTPS CONNECT and SOCKS5.
+listen = "127.0.0.1:7890"
+
+# Files or directories to scan for outbound proxies.
+# Directories are scanned non-recursively and files are processed in sorted order.
+proxy_dirs = ["./proxies"]
+
+# Maximum outbound proxies to try for one inbound request when connection setup fails.
+# If no proxies are loaded, RotatorProxy connects directly.
+max_retries = 10
+
+# Timeout for connecting to a target or outbound proxy.
+connect_timeout_ms = 10000
+
+# Timeout for fetching subscription URLs found in proxy source files.
+subscription_timeout_ms = 15000
+
+# User-Agent sent when fetching subscription URLs.
+subscription_user_agent = "RotatorProxy/0.1"
+
+# Default log level. RUST_LOG overrides this value.
+log_level = "info"
