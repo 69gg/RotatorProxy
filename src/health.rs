@@ -14,6 +14,7 @@ use url::Url;
 use crate::{
     config::AppConfig,
     load_proxies_from_dirs,
+    meow::build_meow_nodes,
     mihomo::{MihomoManager, MihomoPreparedGeneration},
     outbound::{BoxedStream, connect_via_proxy_node},
     proxy::{ProxyNode, ProxyPool, TargetAddr},
@@ -84,12 +85,26 @@ pub async fn refresh_proxy_pool(
         reason,
         loaded_nodes = loaded,
         native_nodes = loaded_set.native.len(),
-        mihomo_nodes = loaded_set.mihomo.len(),
+        complex_nodes = loaded_set.mihomo.len(),
         "loaded proxy nodes"
     );
 
     let mut candidates = loaded_set.native;
-    let prepared_mihomo = match mihomo.prepare_generation(config, loaded_set.mihomo).await {
+    let meow_result = build_meow_nodes(loaded_set.mihomo);
+    let meow_active_candidates = meow_result.nodes.len();
+    let fallback_candidates = meow_result.fallback.len();
+    candidates.extend(meow_result.nodes);
+    info!(
+        reason,
+        meow_nodes = meow_active_candidates,
+        fallback_nodes = fallback_candidates,
+        "complex proxy native backend preparation completed"
+    );
+
+    let prepared_mihomo = match mihomo
+        .prepare_generation(config, meow_result.fallback)
+        .await
+    {
         Ok(prepared) => prepared,
         Err(err) => {
             warn!("failed to prepare mihomo nodes; complex nodes will be skipped: {err:#}");

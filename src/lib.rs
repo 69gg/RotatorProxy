@@ -1,5 +1,6 @@
 pub mod config;
 pub mod health;
+pub mod meow;
 pub mod mihomo;
 pub mod outbound;
 pub mod parser;

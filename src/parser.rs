@@ -356,6 +356,7 @@ fn parse_mihomo_proxy_url(line: &str) -> Result<Option<MihomoProxyConfig>> {
         "trojan" => parse_trojan_url(&url).map(Some),
         "hysteria2" | "hy2" => parse_hysteria2_url(&url).map(Some),
         "tuic" => parse_tuic_url(&url).map(Some),
+        "anytls" => parse_anytls_url(&url).map(Some),
         _ => Ok(None),
     }
 }
@@ -474,6 +475,29 @@ fn parse_tuic_url(url: &Url) -> Result<MihomoProxyConfig> {
     }
     apply_security_query(&mut proxy, url);
     proxy.into_mihomo("tuic")
+}
+
+fn parse_anytls_url(url: &Url) -> Result<MihomoProxyConfig> {
+    let name = proxy_name_from_url(url, "anytls");
+    let server = required_host(url, "anytls")?;
+    let port = url.port().unwrap_or(8443);
+    let password = url
+        .password()
+        .map(decode_url_component)
+        .or_else(|| query_param(url, "password"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("anytls link missing password"))?;
+
+    let mut proxy = ClashProxyDocument::new(name, "anytls", server, port);
+    proxy.insert_string("password", password);
+    if let Some(sni) = query_param(url, "sni").or_else(|| query_param(url, "servername")) {
+        proxy.insert_string("sni", sni.clone());
+        proxy.insert_string("servername", sni);
+    }
+    if query_param(url, "insecure").is_some_and(|value| value == "1" || value == "true") {
+        proxy.insert_bool("skip-cert-verify", true);
+    }
+    proxy.into_mihomo("anytls")
 }
 
 fn parse_ssr_url(encoded: &str) -> Result<MihomoProxyConfig> {
@@ -1105,7 +1129,7 @@ proxies:
     }
 
     #[test]
-    fn sends_complex_clash_nodes_to_mihomo() {
+    fn sends_complex_clash_nodes_to_complex_queue() {
         let yaml = r#"
 proxies:
   - name: vmess-a
@@ -1153,6 +1177,25 @@ proxies:
                 assert!(text.contains("cdn.example.com"));
             }
             ParsedProxyLine::Native(_) => panic!("expected mihomo node"),
+        }
+    }
+
+    #[test]
+    fn parses_anytls_link_as_complex_node() {
+        let parsed =
+            parse_proxy_line("anytls://user:pass@example.com:8443?sni=tls.example.com#anytls-a")
+                .unwrap()
+                .unwrap();
+
+        match parsed {
+            ParsedProxyLine::Mihomo(proxy) => {
+                assert_eq!(proxy.name, "anytls-a");
+                assert_eq!(proxy.kind, "anytls");
+                let text = serde_yaml::to_string(&proxy.value).unwrap();
+                assert!(text.contains("password: pass"));
+                assert!(text.contains("sni: tls.example.com"));
+            }
+            ParsedProxyLine::Native(_) => panic!("expected complex node"),
         }
     }
 

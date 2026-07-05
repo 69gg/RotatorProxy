@@ -48,19 +48,22 @@ cooldown_seconds = 300
 # The service keeps serving with the previous active pool until the new pool is ready.
 daily_refresh_time = "04:00"
 
-# Enable Mihomo sidecar support for complex Clash node types such as vmess,
-# vless, trojan, ssr, hysteria, hysteria2/hy2, tuic, wireguard/wg, anytls,
-# mieru, snell, ssh, and future Clash-compatible node mappings.
-mihomo_enabled = true
+# Enable the optional Mihomo sidecar fallback for Clash node types that the
+# in-process backend cannot currently dial. Most common TCP nodes are handled
+# without Mihomo: vmess, vless, trojan, hysteria2/hy2, snell, anytls, and
+# Shadowsocks with supported built-in plugins. Keep this off unless you need
+# fallback protocols such as tuic, wireguard/wg, mieru, ssh, ssr, or Reality /
+# client-fingerprint variants.
+mihomo_enabled = false
 
 # Optional explicit Mihomo binary path. If unset, RotatorProxy checks PATH for
 # mihomo, clash-meta, then clash.
 # mihomo_binary = "/usr/local/bin/mihomo"
 
-# If no binary is configured or found in PATH, automatically download the latest
-# Mihomo release on Linux amd64/arm64. Other platforms should provide a binary
-# through mihomo_binary or PATH.
-mihomo_auto_download = true
+# If Mihomo fallback is enabled and no binary is configured or found in PATH,
+# automatically download the latest Mihomo release on Linux amd64/arm64. Other
+# platforms should provide a binary through mihomo_binary or PATH.
+mihomo_auto_download = false
 
 # Work directory for downloaded Mihomo binaries and generated generation configs.
 # This path is runtime state and is ignored by Git in the default repository.

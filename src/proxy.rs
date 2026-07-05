@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
+use meow_common::ProxyAdapter;
 use shadowsocks::{ServerConfig, relay::socks5::Address as ShadowAddress};
 use tracing::{debug, info, warn};
 
@@ -45,6 +46,23 @@ pub struct Credentials {
     pub password: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct MeowProxyNode {
+    pub adapter: Arc<dyn ProxyAdapter>,
+    pub key: String,
+    pub label: String,
+}
+
+impl fmt::Debug for MeowProxyNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeowProxyNode")
+            .field("key", &self.key)
+            .field("label", &self.label)
+            .field("adapter", &self.adapter.name())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ProxyNode {
     Http {
@@ -70,6 +88,7 @@ pub enum ProxyNode {
         label: String,
         generation: u64,
     },
+    Meow(MeowProxyNode),
 }
 
 impl ProxyNode {
@@ -90,6 +109,7 @@ impl ProxyNode {
             }
             Self::Shadowsocks { label, .. } => label.clone(),
             Self::LocalMihomo { label, .. } => label.clone(),
+            Self::Meow(node) => node.label.clone(),
         }
     }
 
@@ -122,6 +142,7 @@ impl ProxyNode {
             } => {
                 format!("mihomo://{generation}/{label}@{addr}")
             }
+            Self::Meow(node) => node.key.clone(),
         }
     }
 

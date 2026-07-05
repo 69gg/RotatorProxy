@@ -1,0 +1,592 @@
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow, bail};
+use meow_common::ProxyAdapter;
+use meow_proxy::{
+    AnytlsAdapter, Hy2Adapter, Hy2HopInterval, Hy2Obfs, Hy2Options, ShadowsocksAdapter,
+    SnellAdapter, SnellObfs, SnellVersion, TrojanAdapter, VlessAdapter, VlessFlow, VmessAdapter,
+    shadowsocks_adapter::is_builtin_obfs_plugin,
+};
+use meow_transport::{
+    grpc::{GrpcConfig, GrpcLayer},
+    h2::{H2Config, H2Layer},
+    httpupgrade::{HttpUpgradeConfig, HttpUpgradeLayer},
+    tls::{TlsConfig, TlsLayer},
+    ws::{WsConfig, WsLayer},
+};
+use tracing::{debug, warn};
+use uuid::Uuid;
+
+use crate::{
+    parser::MihomoProxyConfig,
+    proxy::{MeowProxyNode, ProxyNode},
+};
+
+pub struct MeowBuildResult {
+    pub nodes: Vec<ProxyNode>,
+    pub fallback: Vec<MihomoProxyConfig>,
+}
+
+pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
+    let mut nodes = Vec::new();
+    let mut fallback = Vec::new();
+
+    for proxy in proxies {
+        match build_meow_node(&proxy) {
+            Ok(node) => {
+                debug!(node = %node.label(), "complex proxy admitted to native meow backend");
+                nodes.push(node);
+            }
+            Err(err) => {
+                warn!(
+                    node = %proxy.name,
+                    kind = %proxy.kind,
+                    "complex proxy is not supported by native meow backend; trying mihomo fallback: {err:#}"
+                );
+                fallback.push(proxy);
+            }
+        }
+    }
+
+    MeowBuildResult { nodes, fallback }
+}
+
+fn build_meow_node(proxy: &MihomoProxyConfig) -> Result<ProxyNode> {
+    let mapping = proxy_mapping(proxy)?;
+    let kind = string_field(mapping, &["type"])
+        .unwrap_or_else(|| proxy.kind.clone())
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "vmess" => build_vmess(proxy, mapping),
+        "vless" => build_vless(proxy, mapping),
+        "trojan" => build_trojan(proxy, mapping),
+        "hysteria2" | "hy2" => build_hysteria2(proxy, mapping),
+        "snell" => build_snell(proxy, mapping),
+        "anytls" => build_anytls(proxy, mapping),
+        "ss" | "shadowsocks" => build_shadowsocks(proxy, mapping),
+        _ => bail!("unsupported native complex proxy type {kind}"),
+    }
+}
+
+fn build_vmess(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Result<ProxyNode> {
+    let name = node_name(proxy, mapping);
+    let server = required_string(mapping, &["server"], &name)?;
+    let port = required_port(mapping, &["port"], &name)?;
+    let uuid = uuid_bytes(&required_string(mapping, &["uuid", "id"], &name)?)?;
+    let alter_id = u16_field(mapping, &["alterId", "alter-id", "aid"]).unwrap_or(0);
+    if alter_id != 0 {
+        bail!("legacy VMess alterId={alter_id} requires mihomo fallback");
+    }
+    let security = match string_field(mapping, &["cipher", "security", "scy"])
+        .unwrap_or_else(|| "auto".to_owned())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => meow_proxy::vmess::header::auto_security(),
+        "aes-128-gcm" | "aead" => meow_proxy::vmess::Security::Aes128Gcm,
+        "chacha20-poly1305" | "chacha20-ietf-poly1305" => {
+            meow_proxy::vmess::Security::ChaCha20Poly1305
+        }
+        "none" | "zero" => meow_proxy::vmess::Security::None,
+        other => bail!("unsupported VMess security {other}"),
+    };
+    let transport = build_transport_chain(mapping, &server)?;
+    let adapter = VmessAdapter::new(
+        &name,
+        &server,
+        port,
+        uuid,
+        security,
+        bool_field(mapping, &["udp"]).unwrap_or(false),
+        transport,
+    );
+    Ok(meow_node(proxy, name, server, port, Arc::new(adapter)))
+}
+
+fn build_vless(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Result<ProxyNode> {
+    let name = node_name(proxy, mapping);
+    let server = required_string(mapping, &["server"], &name)?;
+    let port = required_port(mapping, &["port"], &name)?;
+    let uuid = uuid_bytes(&required_string(mapping, &["uuid", "id"], &name)?)?;
+    if let Some(encryption) = string_field(mapping, &["encryption"])
+        && !matches!(encryption.as_str(), "" | "none")
+    {
+        bail!("unsupported VLESS encryption {encryption}");
+    }
+    let flow = match string_field(mapping, &["flow"]).as_deref() {
+        Some("xtls-rprx-vision") => Some(VlessFlow::XtlsRprxVision),
+        Some(other) => bail!("unsupported VLESS flow {other}"),
+        None => None,
+    };
+    let transport = build_transport_chain(mapping, &server)?;
+    let adapter = VlessAdapter::new(
+        &name,
+        &server,
+        port,
+        uuid,
+        flow,
+        bool_field(mapping, &["udp"]).unwrap_or(false),
+        transport,
+    );
+    Ok(meow_node(proxy, name, server, port, Arc::new(adapter)))
+}
+
+fn build_trojan(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Result<ProxyNode> {
+    let name = node_name(proxy, mapping);
+    let server = required_string(mapping, &["server"], &name)?;
+    let port = required_port(mapping, &["port"], &name)?;
+    let network = string_field(mapping, &["network", "type"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(network.as_str(), "" | "tcp" | "trojan") {
+        bail!("Trojan over {network} requires mihomo fallback");
+    }
+    let password = required_string(mapping, &["password"], &name)?;
+    let sni = string_field(mapping, &["sni", "servername"]).unwrap_or_else(|| server.clone());
+    let adapter = TrojanAdapter::new(
+        &name,
+        &server,
+        port,
+        &password,
+        &sni,
+        bool_field(mapping, &["skip-cert-verify", "allow-insecure"]).unwrap_or(false),
+        bool_field(mapping, &["udp"]).unwrap_or(false),
+    );
+    Ok(meow_node(proxy, name, server, port, Arc::new(adapter)))
+}
+
+fn build_hysteria2(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Result<ProxyNode> {
+    let name = node_name(proxy, mapping);
+    let server = required_string(mapping, &["server"], &name)?;
+    let port = required_port(mapping, &["port"], &name)?;
+    let password = required_string(mapping, &["password", "auth"], &name)?;
+    let obfs = string_field(mapping, &["obfs"]).map(|value| value.to_ascii_lowercase());
+    let options = Hy2Options {
+        name: name.clone(),
+        server: server.clone(),
+        port,
+        password,
+        sni: string_field(mapping, &["sni", "servername"]),
+        skip_cert_verify: bool_field(mapping, &["skip-cert-verify", "allow-insecure"])
+            .unwrap_or(false),
+        udp: bool_field(mapping, &["udp"]).unwrap_or(false),
+        up_bps: u64_field(mapping, &["up", "up-mbps"]).unwrap_or(0),
+        down_bps: u64_field(mapping, &["down", "down-mbps"]).unwrap_or(0),
+        obfs: match obfs.as_deref() {
+            Some("salamander") => Some(Hy2Obfs::Salamander),
+            Some(other) => bail!("unsupported Hysteria2 obfs {other}"),
+            None => None,
+        },
+        obfs_password: string_field(mapping, &["obfs-password"]),
+        ports: string_field(mapping, &["ports"]),
+        hop_interval: parse_hy2_hop_interval(mapping),
+        fingerprint: string_field(mapping, &["pinSHA256", "fingerprint"]),
+        fast_open: bool_field(mapping, &["fast-open"]).unwrap_or(false),
+    };
+    let adapter = Hy2Adapter::new(options).map_err(|err| anyhow!(err))?;
+    Ok(meow_node(proxy, name, server, port, Arc::new(adapter)))
+}
+
+fn build_snell(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Result<ProxyNode> {
+    let name = node_name(proxy, mapping);
+    let server = required_string(mapping, &["server"], &name)?;
+    let port = required_port(mapping, &["port"], &name)?;
+    let psk = required_string(mapping, &["psk", "password"], &name)?;
+    let version = match string_field(mapping, &["version"])
+        .unwrap_or_else(|| "3".to_owned())
+        .trim_start_matches('v')
+    {
+        "3" => SnellVersion::V3,
+        "4" => SnellVersion::V4,
+        "5" => SnellVersion::V5,
+        other => bail!("unsupported Snell version {other}"),
+    };
+    let obfs = parse_snell_obfs(mapping, &server)?;
+    let adapter = SnellAdapter::new(
+        &name,
+        &server,
+        port,
+        &psk,
+        obfs,
+        version,
+        bool_field(mapping, &["udp"]).unwrap_or(false),
+        bool_field(mapping, &["reuse"]).unwrap_or(false),
+    )?;
+    Ok(meow_node(proxy, name, server, port, Arc::new(adapter)))
+}
+
+fn build_anytls(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Result<ProxyNode> {
+    let name = node_name(proxy, mapping);
+    let server = required_string(mapping, &["server"], &name)?;
+    let port = u16_field(mapping, &["port"]).unwrap_or(8443);
+    let password = required_string(mapping, &["password"], &name)?;
+    let adapter = AnytlsAdapter::new(
+        &name,
+        &server,
+        port,
+        &password,
+        string_field(mapping, &["sni", "servername"]).as_deref(),
+        bool_field(mapping, &["skip-cert-verify", "allow-insecure"]).unwrap_or(false),
+    )
+    .map_err(|err| anyhow!(err))?;
+    Ok(meow_node(proxy, name, server, port, Arc::new(adapter)))
+}
+
+fn build_shadowsocks(
+    proxy: &MihomoProxyConfig,
+    mapping: &serde_yaml::Mapping,
+) -> Result<ProxyNode> {
+    let name = node_name(proxy, mapping);
+    let server = required_string(mapping, &["server"], &name)?;
+    let port = required_port(mapping, &["port"], &name)?;
+    let cipher = required_string(mapping, &["cipher", "method"], &name)?;
+    let password = required_string(mapping, &["password"], &name)?;
+    let plugin = string_field(mapping, &["plugin"]);
+    if let Some(plugin) = plugin.as_deref()
+        && !is_builtin_obfs_plugin(plugin)
+        && plugin != "v2ray-plugin"
+    {
+        bail!("Shadowsocks plugin {plugin} requires mihomo fallback");
+    }
+    let adapter = ShadowsocksAdapter::new(
+        &name,
+        &server,
+        port,
+        &password,
+        &cipher,
+        bool_field(mapping, &["udp"]).unwrap_or(false),
+        plugin.as_deref(),
+        string_field(mapping, &["plugin-opts"]).as_deref(),
+    )?;
+    Ok(meow_node(proxy, name, server, port, Arc::new(adapter)))
+}
+
+fn build_transport_chain(
+    mapping: &serde_yaml::Mapping,
+    server: &str,
+) -> Result<meow_proxy::transport_chain::TransportChain> {
+    if get(mapping, "reality-opts").is_some() {
+        bail!("reality-opts requires mihomo fallback in this build");
+    }
+    if string_field(mapping, &["client-fingerprint", "fingerprint"]).is_some() {
+        bail!("client fingerprint requires mihomo fallback in this build");
+    }
+
+    let mut chain = meow_proxy::transport_chain::TransportChain::empty();
+    if bool_field(mapping, &["tls"]).unwrap_or(false) {
+        let mut config = TlsConfig::new(
+            string_field(mapping, &["servername", "sni"]).unwrap_or_else(|| server.to_owned()),
+        );
+        config.skip_cert_verify =
+            bool_field(mapping, &["skip-cert-verify", "allow-insecure"]).unwrap_or(false);
+        config.alpn = string_list_field(mapping, &["alpn"]).unwrap_or_default();
+        let layer = TlsLayer::new(&config).map_err(|err| anyhow!("{err}"))?;
+        chain.push(Box::new(layer));
+    }
+
+    let network = string_field(mapping, &["network", "type"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match network.as_str() {
+        "" | "tcp" | "vmess" | "vless" => {}
+        "ws" | "websocket" => {
+            let options = mapping_field(mapping, "ws-opts");
+            let config = WsConfig {
+                path: string_field_in(options, &["path"]).unwrap_or_else(|| "/".to_owned()),
+                host_header: string_field_in(options, &["host"])
+                    .or_else(|| header_field(options, "Host"))
+                    .or_else(|| string_field(mapping, &["host"]))
+                    .or_else(|| Some(server.to_owned())),
+                extra_headers: headers_from_mapping(options),
+                max_early_data: usize_field_in(options, &["max-early-data"]).unwrap_or(0),
+                early_data_header_name: string_field_in(options, &["early-data-header-name"]),
+            };
+            chain.push(Box::new(
+                WsLayer::new(config).map_err(|err| anyhow!("{err}"))?,
+            ));
+        }
+        "grpc" => {
+            let options = mapping_field(mapping, "grpc-opts");
+            let config = GrpcConfig {
+                service_name: string_field_in(
+                    options,
+                    &["grpc-service-name", "serviceName", "service-name"],
+                )
+                .unwrap_or_else(|| "GunService".to_owned()),
+                authority: string_field_in(options, &["authority", "host"])
+                    .unwrap_or_else(|| server.to_owned()),
+            };
+            chain.push(Box::new(GrpcLayer::new(config)));
+        }
+        "h2" | "http" => {
+            let options = mapping_field(mapping, "h2-opts");
+            let config = H2Config {
+                path: string_field_in(options, &["path"]).unwrap_or_else(|| "/".to_owned()),
+                hosts: string_list_field_in(options, &["host"])
+                    .or_else(|| string_field(mapping, &["host"]).map(|host| vec![host]))
+                    .unwrap_or_else(|| vec![server.to_owned()]),
+            };
+            chain.push(Box::new(H2Layer::new(config)));
+        }
+        "httpupgrade" | "http-upgrade" => {
+            let options = mapping_field(mapping, "http-upgrade-opts");
+            let config = HttpUpgradeConfig {
+                path: string_field_in(options, &["path"]).unwrap_or_else(|| "/".to_owned()),
+                host_header: string_field_in(options, &["host"])
+                    .or_else(|| Some(server.to_owned())),
+                extra_headers: headers_from_mapping(options),
+            };
+            chain.push(Box::new(HttpUpgradeLayer::new(config)));
+        }
+        other => bail!("unsupported transport network {other}"),
+    }
+    Ok(chain)
+}
+
+fn meow_node(
+    proxy: &MihomoProxyConfig,
+    name: String,
+    server: String,
+    port: u16,
+    adapter: Arc<dyn ProxyAdapter>,
+) -> ProxyNode {
+    ProxyNode::Meow(MeowProxyNode {
+        adapter,
+        key: format!("meow://{}:{name}@{server}:{port}", proxy.kind),
+        label: format!("meow:{}:{name}", proxy.kind),
+    })
+}
+
+fn proxy_mapping(proxy: &MihomoProxyConfig) -> Result<&serde_yaml::Mapping> {
+    proxy
+        .value
+        .as_mapping()
+        .ok_or_else(|| anyhow!("complex proxy {} is not a YAML mapping", proxy.name))
+}
+
+fn node_name(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> String {
+    string_field(mapping, &["name"]).unwrap_or_else(|| proxy.name.clone())
+}
+
+fn required_string(mapping: &serde_yaml::Mapping, keys: &[&str], name: &str) -> Result<String> {
+    string_field(mapping, keys).ok_or_else(|| anyhow!("proxy {name} missing {}", keys.join("/")))
+}
+
+fn required_port(mapping: &serde_yaml::Mapping, keys: &[&str], name: &str) -> Result<u16> {
+    u16_field(mapping, keys).ok_or_else(|| anyhow!("proxy {name} missing {}", keys.join("/")))
+}
+
+fn uuid_bytes(value: &str) -> Result<[u8; 16]> {
+    Ok(*Uuid::parse_str(value)
+        .with_context(|| format!("invalid uuid {value}"))?
+        .as_bytes())
+}
+
+fn parse_hy2_hop_interval(mapping: &serde_yaml::Mapping) -> Option<Hy2HopInterval> {
+    let raw = string_field(mapping, &["hop-interval"])?;
+    let (min, max) = raw.split_once('-')?;
+    Some(Hy2HopInterval {
+        min_secs: min.parse().ok()?,
+        max_secs: max.parse().ok()?,
+    })
+}
+
+fn parse_snell_obfs(mapping: &serde_yaml::Mapping, server: &str) -> Result<SnellObfs> {
+    let Some(options) = mapping_field(mapping, "obfs-opts") else {
+        return Ok(SnellObfs::None);
+    };
+    let mode = string_field_in(Some(options), &["mode"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match mode.as_str() {
+        "" => Ok(SnellObfs::None),
+        "http" => Ok(SnellObfs::Http {
+            host: string_field_in(Some(options), &["host"]).unwrap_or_else(|| server.to_owned()),
+        }),
+        "tls" => Ok(SnellObfs::Tls {
+            server: string_field_in(Some(options), &["host", "server"])
+                .unwrap_or_else(|| server.to_owned()),
+        }),
+        other => bail!("unsupported Snell obfs mode {other}"),
+    }
+}
+
+fn get<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
+    mapping.get(serde_yaml::Value::String(key.to_owned()))
+}
+
+fn mapping_field<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Mapping> {
+    get(mapping, key)?.as_mapping()
+}
+
+fn string_field(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<String> {
+    string_field_in(Some(mapping), keys)
+}
+
+fn string_field_in(mapping: Option<&serde_yaml::Mapping>, keys: &[&str]) -> Option<String> {
+    let mapping = mapping?;
+    keys.iter()
+        .find_map(|key| value_to_string(get(mapping, key)?))
+}
+
+fn string_list_field(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<Vec<String>> {
+    string_list_field_in(Some(mapping), keys)
+}
+
+fn string_list_field_in(
+    mapping: Option<&serde_yaml::Mapping>,
+    keys: &[&str],
+) -> Option<Vec<String>> {
+    let mapping = mapping?;
+    keys.iter()
+        .find_map(|key| value_to_string_list(get(mapping, key)?))
+}
+
+fn header_field(mapping: Option<&serde_yaml::Mapping>, key: &str) -> Option<String> {
+    let headers = mapping_field(mapping?, "headers")?;
+    string_field_in(Some(headers), &[key])
+}
+
+fn headers_from_mapping(mapping: Option<&serde_yaml::Mapping>) -> Vec<(String, String)> {
+    let Some(headers) = mapping.and_then(|mapping| mapping_field(mapping, "headers")) else {
+        return Vec::new();
+    };
+    headers
+        .iter()
+        .filter_map(|(key, value)| Some((value_to_string(key)?, value_to_string(value)?)))
+        .collect()
+}
+
+fn bool_field(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value_to_bool(get(mapping, key)?))
+}
+
+fn u16_field(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<u16> {
+    keys.iter()
+        .find_map(|key| value_to_u64(get(mapping, key)?).and_then(|value| value.try_into().ok()))
+}
+
+fn u64_field(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| value_to_u64(get(mapping, key)?))
+}
+
+fn usize_field_in(mapping: Option<&serde_yaml::Mapping>, keys: &[&str]) -> Option<usize> {
+    let mapping = mapping?;
+    keys.iter()
+        .find_map(|key| value_to_u64(get(mapping, key)?).and_then(|value| value.try_into().ok()))
+}
+
+fn value_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(value) => Some(value.clone()),
+        serde_yaml::Value::Number(value) => Some(value.to_string()),
+        serde_yaml::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn value_to_string_list(value: &serde_yaml::Value) -> Option<Vec<String>> {
+    match value {
+        serde_yaml::Value::Sequence(values) => {
+            Some(values.iter().filter_map(value_to_string).collect())
+        }
+        _ => value_to_string(value).map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        }),
+    }
+}
+
+fn value_to_bool(value: &serde_yaml::Value) -> Option<bool> {
+    match value {
+        serde_yaml::Value::Bool(value) => Some(*value),
+        serde_yaml::Value::Number(value) => Some(value.as_u64()? != 0),
+        serde_yaml::Value::String(value) => Some(matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )),
+        _ => None,
+    }
+}
+
+fn value_to_u64(value: &serde_yaml::Value) -> Option<u64> {
+    match value {
+        serde_yaml::Value::Number(value) => value.as_u64(),
+        serde_yaml::Value::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complex(yaml: &str) -> MihomoProxyConfig {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let mapping = value.as_mapping().unwrap();
+        MihomoProxyConfig {
+            name: string_field(mapping, &["name"]).unwrap(),
+            kind: string_field(mapping, &["type"]).unwrap(),
+            value,
+        }
+    }
+
+    #[tokio::test]
+    async fn builds_anytls_adapter() {
+        let proxy = complex(
+            r#"
+name: anytls-a
+type: anytls
+server: example.com
+port: 8443
+password: pass
+sni: example.com
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
+        assert_eq!(result.nodes[0].label(), "meow:anytls:anytls-a");
+    }
+
+    #[test]
+    fn unsupported_tuic_falls_back() {
+        let proxy = complex(
+            r#"
+name: tuic-a
+type: tuic
+server: example.com
+port: 443
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 0);
+        assert_eq!(result.fallback.len(), 1);
+    }
+
+    #[test]
+    fn reality_vless_falls_back() {
+        let proxy = complex(
+            r#"
+name: vless-reality
+type: vless
+server: example.com
+port: 443
+uuid: 00000000-0000-0000-0000-000000000000
+reality-opts:
+  public-key: abc
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 0);
+        assert_eq!(result.fallback.len(), 1);
+    }
+}

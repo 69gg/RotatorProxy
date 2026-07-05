@@ -5,6 +5,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use meow_common::{ConnType, Metadata, Network};
 use shadowsocks::{
     ProxyClientStream,
     config::ServerType,
@@ -139,7 +140,31 @@ async fn connect_proxy_node(
             Ok(Box::new(stream))
         }
         ProxyNode::LocalMihomo { addr, .. } => connect_http_proxy(&addr, None, target).await,
+        ProxyNode::Meow(node) => {
+            let metadata = metadata_from_target(target);
+            let stream = node
+                .adapter
+                .dial_tcp(&metadata)
+                .await
+                .map_err(|err| io::Error::other(format!("meow proxy dial failed: {err}")))?;
+            Ok(Box::new(stream))
+        }
     }
+}
+
+fn metadata_from_target(target: &TargetAddr) -> Metadata {
+    let mut metadata = Metadata {
+        network: Network::Tcp,
+        conn_type: ConnType::Inner,
+        dst_port: target.port,
+        ..Metadata::default()
+    };
+    if let Ok(ip) = target.host.parse::<IpAddr>() {
+        metadata.dst_ip = Some(ip);
+    } else {
+        metadata.host = Metadata::lower_host(&target.host);
+    }
+    metadata
 }
 
 async fn connect_direct(target: &TargetAddr) -> io::Result<BoxedStream> {

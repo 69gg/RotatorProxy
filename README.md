@@ -16,7 +16,8 @@ RotatorProxy is a single-port proxy rotator. It accepts HTTP proxy requests, HTT
   - SOCKS5 and SOCKS5h via `socks5://host:port` and `socks5h://host:port`
   - SOCKS4 and SOCKS4a via `socks4://host:port` and `socks4a://host:port`
   - Shadowsocks SIP002 `ss://` URLs
-  - Complex Clash-compatible nodes through a Mihomo sidecar, including VMess, VLESS, Trojan, SSR, Hysteria/Hysteria2, TUIC, WireGuard, AnyTLS, Mieru, Snell, SSH, and other node mappings Mihomo understands
+  - In-process complex nodes through `meow-proxy`: VMess, VLESS, Trojan, Hysteria2/Hy2, Snell, AnyTLS, and Shadowsocks with supported built-in plugins
+  - Optional Mihomo sidecar fallback for complex nodes that are not supported by the in-process backend
 - Source loading from local files/directories, subscription URLs, Clash YAML, and common Base64 subscriptions.
 
 ## Quick Start
@@ -45,9 +46,9 @@ See [config.toml.example](config.toml.example). The important fields are:
 - `runtime_failure_threshold`: runtime connection failures before an active node enters cooldown.
 - `cooldown_seconds`: duration for skipping a runtime-failing active node.
 - `daily_refresh_time`: local `HH:MM` time for the daily full source reload and health check.
-- `mihomo_enabled`: enables Mihomo sidecar support for complex Clash node types.
+- `mihomo_enabled`: enables the optional Mihomo sidecar fallback for complex Clash node types that the embedded backend cannot dial. Disabled by default.
 - `mihomo_binary`: optional explicit Mihomo binary path. If unset, `mihomo`, `clash-meta`, then `clash` are searched in `PATH`.
-- `mihomo_auto_download`: when enabled, Linux amd64/arm64 hosts can download the latest Mihomo release automatically.
+- `mihomo_auto_download`: when enabled together with `mihomo_enabled`, Linux amd64/arm64 hosts can download the latest Mihomo release automatically.
 - `mihomo_work_dir`: runtime directory for downloaded binaries and generated sidecar configs.
 - `mihomo_startup_timeout_ms`: maximum wait for a new Mihomo generation to open its local listeners.
 - `mihomo_retire_grace_seconds`: delay before an old Mihomo generation is killed after a pool swap.
@@ -105,29 +106,31 @@ proxies:
 
 Base64 subscriptions are supported when the entire fetched body or file content is a Base64-encoded text document. After decoding, RotatorProxy parses the decoded content as the same line-based or Clash YAML formats.
 
-Common URI-style complex links such as `vmess://`, `vless://`, `trojan://`, `ssr://`, `hysteria2://`, `hy2://`, and `tuic://` are converted into Clash-style Mihomo node objects. Full Clash YAML remains the most complete format because unknown or protocol-specific fields are preserved and passed directly to Mihomo.
+Common URI-style complex links such as `vmess://`, `vless://`, `trojan://`, `hysteria2://`, `hy2://`, `anytls://`, `ssr://`, and `tuic://` are converted into Clash-style node objects. Full Clash YAML remains the most complete format because unknown or protocol-specific fields are preserved for the native builder or optional Mihomo fallback.
 
-## Clash And Mihomo Nodes
+## Clash-Compatible Nodes
 
-RotatorProxy handles simple outbound protocols natively when the implementation is complete and predictable: HTTP, SOCKS4/5, and plain Shadowsocks. Other Clash node types are not reimplemented in this project. They are kept as Clash/Mihomo node YAML and handed to a Mihomo sidecar.
+RotatorProxy handles common TCP proxy protocols in-process. Simple protocols use local implementations: HTTP, SOCKS4/5, and plain Shadowsocks. Complex Clash-compatible nodes are first built with the embedded `meow-proxy` backend. That path currently covers VMess, VLESS, Trojan, Hysteria2/Hy2, Snell, AnyTLS, and Shadowsocks with supported built-in plugins.
 
-For each complex node in a refresh generation, RotatorProxy generates one local Mihomo `mixed` listener bound to `127.0.0.1` and sets that listener's `proxy` field to exactly one internal proxy name. The rotator then treats that listener as a normal outbound candidate. This avoids global selector switching and keeps concurrent requests pinned to the node selected by the rotator.
+When a node uses fields that the embedded backend cannot safely reproduce, such as TUIC, WireGuard/WG, Mieru, SSH, SSR, Reality options, or client fingerprint/uTLS settings, it is sent to the optional Mihomo fallback queue. Mihomo fallback is disabled by default. With the default config, unsupported fallback-only nodes are logged and skipped instead of starting or downloading an external executable.
 
-On Linux `x86_64` and `aarch64`, RotatorProxy can automatically download the latest Mihomo gzip release asset for `amd64` or `arm64`. On other platforms, or if you want fixed binary provenance, install Mihomo yourself and set `mihomo_binary` or put it in `PATH`.
+If `mihomo_enabled = true`, RotatorProxy generates one local Mihomo `mixed` listener per fallback node, bound to `127.0.0.1`, and sets that listener's `proxy` field to exactly one internal proxy name. The rotator then treats that listener as a normal outbound candidate. This avoids global selector switching and keeps concurrent requests pinned to the node selected by the rotator.
+
+On Linux `x86_64` and `aarch64`, RotatorProxy can automatically download the latest Mihomo gzip release asset for `amd64` or `arm64` when both `mihomo_enabled` and `mihomo_auto_download` are true. On other platforms, or if you want fixed binary provenance, install Mihomo yourself and set `mihomo_binary` or put it in `PATH`.
 
 ## Refresh And Health Checks
 
-RotatorProxy does not watch input directories. It reloads files and subscription URLs only at startup and at the configured daily refresh time. Startup does not provide service until all sources are loaded, Mihomo listeners are prepared, and batch health checks finish. Scheduled refreshes do not stop the service: the current active pool keeps serving while the new pool is downloaded, parsed, prepared, and health-checked, then the active pool is swapped in one step.
+RotatorProxy does not watch input directories. It reloads files and subscription URLs only at startup and at the configured daily refresh time. Startup does not provide service until all sources are loaded, native complex nodes and optional Mihomo fallback listeners are prepared, and batch health checks finish. Scheduled refreshes do not stop the service: the current active pool keeps serving while the new pool is downloaded, parsed, prepared, and health-checked, then the active pool is swapped in one step.
 
 During batch health checks, RotatorProxy sends an HTTP request to `health_check_url` through each candidate node, similar to Clash-style URL delay testing rather than ICMP ping. A node that fails all configured attempts is not admitted to the active rotation pool. During normal traffic, if an admitted node fails connection setup repeatedly, it enters cooldown and is skipped until the cooldown expires.
 
-For Mihomo-backed nodes, a new sidecar generation is started before health checks. If at least one of its nodes passes, that generation is activated and the old generation is retired after `mihomo_retire_grace_seconds`. If none pass, the new generation is discarded and no failed nodes enter rotation.
+For Mihomo-backed fallback nodes, a new sidecar generation is started before health checks. If at least one of its nodes passes, that generation is activated and the old generation is retired after `mihomo_retire_grace_seconds`. If none pass, the new generation is discarded and no failed nodes enter rotation.
 
 Logs include source reloads, subscription fetch failures, health-check admission/rejection, pool swaps, runtime failures, and cooldown transitions.
 
 ## Current Scope
 
-RotatorProxy is a TCP proxy rotator. It does not implement UDP associate or a Clash rules engine in its own process. Complex Clash protocols are delegated to Mihomo, so their availability follows the Mihomo binary you run. Unknown non-Clash line formats are skipped with a warning.
+RotatorProxy is a TCP proxy rotator. It does not implement UDP associate or a Clash rules engine in its own process. Complex TCP protocols are handled by the embedded backend where supported; fallback-only Clash protocols require explicit Mihomo enablement. Unknown non-Clash line formats are skipped with a warning.
 
 Health checks currently use an `http://` URL so they can run through every supported TCP proxy without adding a TLS client into the check path.
 
@@ -150,3 +153,7 @@ The integration tests cover:
 - Batch health refresh filtering and active-pool swap.
 - Parser coverage for native Clash nodes, complex Clash nodes, and common complex URI links.
 - Mihomo generation config rendering without starting a real Mihomo process.
+
+## License
+
+RotatorProxy is licensed as GPL-3.0-only. Copyright (C) 2026 Null <pylindex@qq.com>.
