@@ -1,8 +1,8 @@
 use std::{fs, io, net::SocketAddr, time::Duration};
 
 use rotator_proxy::{
-    AppConfig, HostPort, ProxyNode, ProxyPool, health::refresh_proxy_pool, outbound::Connector,
-    server::run_listener,
+    AppConfig, HostPort, MihomoManager, ProxyNode, ProxyPool, health::refresh_proxy_pool,
+    outbound::Connector, server::run_listener,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
@@ -264,10 +264,14 @@ async fn health_refresh_filters_failed_proxy_and_swaps_pool() -> io::Result<()> 
         health_check_attempts: 1,
         health_check_timeout_ms: 500,
         health_check_concurrency: 2,
+        mihomo_enabled: false,
         ..AppConfig::default()
     };
     let pool = ProxyPool::with_runtime_options(Vec::new(), 2, 3, Duration::from_secs(60));
-    let summary = refresh_proxy_pool(&config, &pool, "test").await.unwrap();
+    let mihomo = MihomoManager::new();
+    let summary = refresh_proxy_pool(&config, &pool, &mihomo, "test")
+        .await
+        .unwrap();
 
     assert_eq!(summary.loaded, 2);
     assert_eq!(summary.active, 1);

@@ -14,6 +14,7 @@ use url::Url;
 use crate::{
     config::AppConfig,
     load_proxies_from_dirs,
+    mihomo::{MihomoManager, MihomoPreparedGeneration},
     outbound::{BoxedStream, connect_via_proxy_node},
     proxy::{ProxyNode, ProxyPool, TargetAddr},
 };
@@ -73,14 +74,33 @@ impl HealthCheckTarget {
 pub async fn refresh_proxy_pool(
     config: &AppConfig,
     pool: &ProxyPool,
+    mihomo: &MihomoManager,
     reason: &str,
 ) -> Result<RefreshSummary> {
     info!(reason, "starting proxy source reload and health check");
-    let proxies = load_proxies_from_dirs(config).await?;
-    let loaded = proxies.len();
-    info!(reason, loaded_nodes = loaded, "loaded proxy nodes");
+    let loaded_set = load_proxies_from_dirs(config).await?;
+    let loaded = loaded_set.total_len();
+    info!(
+        reason,
+        loaded_nodes = loaded,
+        native_nodes = loaded_set.native.len(),
+        mihomo_nodes = loaded_set.mihomo.len(),
+        "loaded proxy nodes"
+    );
 
-    let active = health_check_proxies(config, proxies).await?;
+    let mut candidates = loaded_set.native;
+    let prepared_mihomo = match mihomo.prepare_generation(config, loaded_set.mihomo).await {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            warn!("failed to prepare mihomo nodes; complex nodes will be skipped: {err:#}");
+            None
+        }
+    };
+    if let Some(prepared) = &prepared_mihomo {
+        candidates.extend_from_slice(prepared.nodes());
+    }
+
+    let active = health_check_proxies(config, candidates).await?;
     let active_len = active.len();
     if loaded > 0 && active_len == 0 {
         warn!(
@@ -90,6 +110,7 @@ pub async fn refresh_proxy_pool(
         );
     }
 
+    apply_mihomo_generation(mihomo, prepared_mihomo, &active, config).await;
     pool.replace(active);
     info!(
         reason,
@@ -105,7 +126,44 @@ pub async fn refresh_proxy_pool(
     })
 }
 
-pub fn spawn_daily_refresh(config: AppConfig, pool: ProxyPool) -> JoinHandle<()> {
+async fn apply_mihomo_generation(
+    mihomo: &MihomoManager,
+    prepared: Option<MihomoPreparedGeneration>,
+    active: &[ProxyNode],
+    config: &AppConfig,
+) {
+    let retire_grace = Duration::from_secs(config.mihomo_retire_grace_seconds);
+    let Some(prepared) = prepared else {
+        if !active
+            .iter()
+            .any(|proxy| proxy.mihomo_generation().is_some())
+        {
+            mihomo.deactivate(retire_grace).await;
+        }
+        return;
+    };
+    let generation = prepared.generation_id();
+    let active_generation = active
+        .iter()
+        .any(|proxy| proxy.mihomo_generation() == Some(generation));
+    if active_generation {
+        mihomo
+            .activate(prepared.into_generation(), retire_grace)
+            .await;
+    } else {
+        warn!(
+            generation,
+            "all mihomo-backed nodes failed health checks; generation will not be activated"
+        );
+        mihomo.deactivate(retire_grace).await;
+    }
+}
+
+pub fn spawn_daily_refresh(
+    config: AppConfig,
+    pool: ProxyPool,
+    mihomo: MihomoManager,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let refresh_time = match parse_daily_refresh_time(&config.daily_refresh_time) {
             Ok(refresh_time) => refresh_time,
@@ -124,7 +182,7 @@ pub fn spawn_daily_refresh(config: AppConfig, pool: ProxyPool) -> JoinHandle<()>
             );
             sleep(wait).await;
 
-            if let Err(err) = refresh_proxy_pool(&config, &pool, "scheduled").await {
+            if let Err(err) = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled").await {
                 error!("scheduled proxy refresh failed; keeping previous active pool: {err:#}");
             }
         }

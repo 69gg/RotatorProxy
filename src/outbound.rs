@@ -138,6 +138,7 @@ async fn connect_proxy_node(
             .await?;
             Ok(Box::new(stream))
         }
+        ProxyNode::LocalMihomo { addr, .. } => connect_http_proxy(&addr, None, target).await,
     }
 }
 

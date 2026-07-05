@@ -47,3 +47,32 @@ cooldown_seconds = 300
 # Local time for the daily full reload + health check.
 # The service keeps serving with the previous active pool until the new pool is ready.
 daily_refresh_time = "04:00"
+
+# Enable Mihomo sidecar support for complex Clash node types such as vmess,
+# vless, trojan, ssr, hysteria, hysteria2/hy2, tuic, wireguard/wg, anytls,
+# mieru, snell, ssh, and future Clash-compatible node mappings.
+mihomo_enabled = true
+
+# Optional explicit Mihomo binary path. If unset, RotatorProxy checks PATH for
+# mihomo, clash-meta, then clash.
+# mihomo_binary = "/usr/local/bin/mihomo"
+
+# If no binary is configured or found in PATH, automatically download the latest
+# Mihomo release on Linux amd64/arm64. Other platforms should provide a binary
+# through mihomo_binary or PATH.
+mihomo_auto_download = true
+
+# Work directory for downloaded Mihomo binaries and generated generation configs.
+# This path is runtime state and is ignored by Git in the default repository.
+mihomo_work_dir = ".rotator-proxy/mihomo"
+
+# Log level written into generated Mihomo configs.
+mihomo_log_level = "warning"
+
+# Maximum time to wait for a newly spawned Mihomo generation to open all local
+# listeners before its nodes are skipped for that refresh.
+mihomo_startup_timeout_ms = 10000
+
+# After a successful refresh swaps in a new pool, keep the previous Mihomo
+# generation alive for this long so existing connections can drain.
+mihomo_retire_grace_seconds = 300

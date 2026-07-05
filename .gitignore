@@ -2,3 +2,6 @@
 
 # Local runtime configuration. Copy config.toml.example to config.toml and edit it.
 config.toml
+
+# Runtime sidecar binaries, generated Mihomo configs, and temporary state.
+.rotator-proxy/

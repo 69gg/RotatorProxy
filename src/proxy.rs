@@ -65,6 +65,11 @@ pub enum ProxyNode {
         server: Arc<ServerConfig>,
         label: String,
     },
+    LocalMihomo {
+        addr: HostPort,
+        label: String,
+        generation: u64,
+    },
 }
 
 impl ProxyNode {
@@ -84,6 +89,7 @@ impl ProxyNode {
                 format!("{scheme}://{addr}")
             }
             Self::Shadowsocks { label, .. } => label.clone(),
+            Self::LocalMihomo { label, .. } => label.clone(),
         }
     }
 
@@ -109,6 +115,20 @@ impl ProxyNode {
             Self::Shadowsocks { server, .. } => {
                 format!("ss://{}@{}", server.method(), server.addr())
             }
+            Self::LocalMihomo {
+                addr,
+                label,
+                generation,
+            } => {
+                format!("mihomo://{generation}/{label}@{addr}")
+            }
+        }
+    }
+
+    pub fn mihomo_generation(&self) -> Option<u64> {
+        match self {
+            Self::LocalMihomo { generation, .. } => Some(*generation),
+            _ => None,
         }
     }
 }
