@@ -16,7 +16,8 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/53
 const SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES: &[&str] =
     &["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
 const DEFAULT_LOG_LEVEL: &str = "info";
-const DEFAULT_HEALTH_CHECK_URL: &str = "http://example.com/";
+const DEFAULT_HEALTH_CHECK_URL: &str = "http://cp.cloudflare.com/generate_204";
+const DEFAULT_HEALTH_CHECK_EXPECTED_STATUS: &str = "204";
 const DEFAULT_HEALTH_CHECK_ATTEMPTS: usize = 3;
 const DEFAULT_HEALTH_CHECK_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_HEALTH_CHECK_CONCURRENCY: usize = 256;
@@ -43,6 +44,7 @@ pub struct AppConfig {
     pub subscription_proxy: Option<String>,
     pub log_level: String,
     pub health_check_url: String,
+    pub health_check_expected_status: String,
     pub health_check_attempts: usize,
     pub health_check_timeout_ms: u64,
     pub health_check_concurrency: usize,
@@ -71,6 +73,7 @@ impl Default for AppConfig {
             subscription_proxy: None,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             health_check_url: DEFAULT_HEALTH_CHECK_URL.to_owned(),
+            health_check_expected_status: DEFAULT_HEALTH_CHECK_EXPECTED_STATUS.to_owned(),
             health_check_attempts: DEFAULT_HEALTH_CHECK_ATTEMPTS,
             health_check_timeout_ms: DEFAULT_HEALTH_CHECK_TIMEOUT_MS,
             health_check_concurrency: DEFAULT_HEALTH_CHECK_CONCURRENCY,
@@ -124,6 +127,7 @@ impl AppConfig {
         if health_url.host_str().is_none() {
             bail!("health_check_url 必须包含 host");
         }
+        parse_health_check_expected_status(&self.health_check_expected_status)?;
         if self.health_check_attempts == 0 {
             bail!("health_check_attempts 必须大于 0");
         }
@@ -165,6 +169,56 @@ impl AppConfig {
 
 pub fn supported_subscription_proxy_scheme(scheme: &str) -> bool {
     SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES.contains(&scheme)
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct StatusRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl StatusRange {
+    pub fn contains(self, status: u16) -> bool {
+        (self.start..=self.end).contains(&status)
+    }
+}
+
+pub fn parse_health_check_expected_status(value: &str) -> Result<Vec<StatusRange>> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("health_check_expected_status 不能为空");
+    }
+
+    let ranges = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(parse_status_range)
+        .collect::<Result<Vec<_>>>()?;
+    if ranges.is_empty() {
+        bail!("health_check_expected_status 必须包含至少一个状态码或范围");
+    }
+    Ok(ranges)
+}
+
+fn parse_status_range(value: &str) -> Result<StatusRange> {
+    let (start, end) = value.split_once('-').unwrap_or((value, value));
+    let start = parse_http_status_code(start)?;
+    let end = parse_http_status_code(end)?;
+    if start > end {
+        bail!("health_check_expected_status 范围起点不能大于终点：{value}");
+    }
+    Ok(StatusRange { start, end })
+}
+
+fn parse_http_status_code(value: &str) -> Result<u16> {
+    let status = value
+        .parse::<u16>()
+        .with_context(|| format!("health_check_expected_status 状态码无效：{value}"))?;
+    if !(100..=599).contains(&status) {
+        bail!("health_check_expected_status 状态码必须在 100-599：{status}");
+    }
+    Ok(status)
 }
 
 fn validate_subscription_proxy(proxy: &str) -> Result<()> {
@@ -219,6 +273,11 @@ proxy_dirs = ["./fixtures"]
         let config: AppConfig = toml::from_str(raw).unwrap();
         assert_eq!(config.listen, "127.0.0.1:9000");
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(
+            config.health_check_url,
+            "http://cp.cloudflare.com/generate_204"
+        );
+        assert_eq!(config.health_check_expected_status, "204");
         assert_eq!(config.health_check_attempts, DEFAULT_HEALTH_CHECK_ATTEMPTS);
         assert!(config.subscription_proxy.is_none());
         assert!(!config.mihomo_enabled);
@@ -271,6 +330,23 @@ proxy_dirs = ["./fixtures"]
     fn rejects_unsupported_health_check_url_scheme() {
         let config = AppConfig {
             health_check_url: "ftp://example.com/".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_health_check_expected_status_ranges() {
+        let ranges = parse_health_check_expected_status("204, 200-299").unwrap();
+        assert!(ranges.iter().any(|range| range.contains(204)));
+        assert!(ranges.iter().any(|range| range.contains(250)));
+        assert!(!ranges.iter().any(|range| range.contains(404)));
+    }
+
+    #[test]
+    fn rejects_invalid_health_check_expected_status() {
+        let config = AppConfig {
+            health_check_expected_status: "600".to_owned(),
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());

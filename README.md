@@ -41,7 +41,8 @@ cargo run --release -- --config config.toml
 - `subscription_user_agent`：获取订阅时使用的 User-Agent。
 - `subscription_proxy`：可选代理 URL，只用于获取订阅/Clash 配置 URL 和自动下载 Mihomo。支持 `http`、`https`、`socks4`、`socks4a`、`socks5`、`socks5h`。
 - `log_level`：默认日志级别。`RUST_LOG` 会覆盖该值。
-- `health_check_url`：用于节点测活的 HTTP 或 HTTPS URL。返回任意 2xx/3xx 状态码即认为健康。
+- `health_check_url`：用于节点测活的 HTTP 或 HTTPS URL，默认 `http://cp.cloudflare.com/generate_204`。
+- `health_check_expected_status`：测活成功期望状态码，默认 `204`。支持精确值和逗号分隔范围，例如 `204` 或 `200-299`。
 - `health_check_attempts`：节点被排除出活动代理池前的测活尝试次数。
 - `health_check_concurrency`：批量测活时的最大并发数。节点很多时建议设置为 `128` 到 `512`。
 - `health_check_tls_skip_verify`：显式设为 `true` 时跳过 HTTPS 测活证书校验，默认 `false`。
@@ -132,7 +133,9 @@ Reality 和真实 uTLS/client-fingerprint 支持使用 `meow-transport` 的 Bori
 
 RotatorProxy 不会监控输入目录变化。它只会在启动时和配置的每日刷新时间重新加载文件与订阅 URL。启动阶段不会先提供服务，而是等待所有来源加载、原生复杂节点构建、可选 Mihomo fallback 监听器准备，以及批量健康检查全部完成。定时刷新不会停止服务：当前活动代理池会继续处理请求，新的代理池会在下载、解析、准备和测活完成后一次性切换。
 
-批量测活时，RotatorProxy 会通过每个候选节点向 `health_check_url` 发起 HTTP/HTTPS 请求，类似 Clash 的 URL delay 测试，而不是 ICMP ping。HTTPS 测活默认校验证书；只有私有或自签测活端点才建议设置 `health_check_tls_skip_verify = true`。节点如果在配置次数内全部测活失败，就不会进入活动轮换池。正常转发流量时，已入池节点如果连续连接失败，会进入冷却并在冷却结束前被跳过。
+批量测活时，RotatorProxy 会通过每个候选节点向 `health_check_url` 发起 HTTP/HTTPS 请求，类似 Clash/Mihomo 的 URL delay 测试，而不是 ICMP ping。响应状态码必须匹配 `health_check_expected_status`。通过测活的节点会记录本次延迟，活动池按延迟从低到高排序后再进入轮询。HTTPS 测活默认校验证书；只有私有或自签测活端点才建议设置 `health_check_tls_skip_verify = true`。节点如果在配置次数内全部测活失败，就不会进入活动轮换池。正常转发流量时，已入池节点如果连续连接失败，会进入冷却并在冷却结束前被跳过。
+
+启动阶段如果没有任何健康节点，会按空活动池启动。定时刷新阶段如果新一轮测活没有任何健康节点，RotatorProxy 会保留上一版活动池继续服务，避免公开源短时波动把可用池清空。
 
 对于 Mihomo-backed fallback 节点，新 sidecar generation 会在测活前启动。如果其中至少一个节点测活通过，该 generation 会被激活，旧 generation 会在 `mihomo_retire_grace_seconds` 后退出。如果没有节点通过，新 generation 会被丢弃，失败节点不会进入轮换。
 
@@ -161,6 +164,7 @@ cargo test
 - SOCKS5 入站转发。
 - 第一个出站代理失败时重试下一个代理。
 - 批量健康刷新过滤失败代理并切换活动代理池。
+- 定时刷新全失败时保留上一版活动代理池。
 - HTTPS 健康检查显式跳过证书校验。
 - 原生 Clash 节点、复杂 Clash 节点、HTTPS 代理和常见复杂 URI 链接的解析覆盖。
 - HTTPS 出站代理可参与批量健康检查。

@@ -1,7 +1,7 @@
 use std::{
     fmt, io,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, StatusRange, parse_health_check_expected_status},
     load_proxies_from_dirs,
     meow::build_meow_nodes,
     mihomo::{MihomoManager, MihomoPreparedGeneration},
@@ -49,12 +49,27 @@ pub struct RefreshSummary {
     pub active: usize,
 }
 
+struct HealthyProxy {
+    proxy: ProxyNode,
+    delay: Duration,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct LatencyStats {
+    min_ms: u128,
+    p50_ms: u128,
+    p90_ms: u128,
+    max_ms: u128,
+}
+
 #[derive(Debug, Clone)]
 struct HealthCheckTarget {
     scheme: HealthCheckScheme,
     target: TargetAddr,
     request: Arc<[u8]>,
     display: String,
+    expected_status: Vec<StatusRange>,
+    expected_display: String,
     tls: Option<HealthCheckTls>,
 }
 
@@ -96,11 +111,15 @@ impl HealthCheckTarget {
                 config.health_check_tls_skip_verify,
             )?),
         };
+        let expected_status =
+            parse_health_check_expected_status(&config.health_check_expected_status)?;
         Ok(Self {
             scheme,
             target,
             request: request.into(),
             display: config.health_check_url.clone(),
+            expected_status,
+            expected_display: config.health_check_expected_status.clone(),
             tls,
         })
     }
@@ -232,6 +251,18 @@ pub async fn refresh_proxy_pool(
     let active = health_check_proxies(config, candidates).await?;
     let active_len = active.len();
     if loaded > 0 && active_len == 0 {
+        if reason != "startup" && !pool.is_empty() {
+            warn!(
+                reason,
+                loaded_nodes = loaded,
+                retained_active_nodes = pool.len(),
+                "本次刷新没有健康节点，保留上一版活动代理池"
+            );
+            return Ok(RefreshSummary {
+                loaded,
+                active: pool.len(),
+            });
+        }
         warn!(
             reason,
             loaded_nodes = loaded,
@@ -367,6 +398,7 @@ async fn health_check_proxies(
     let worker_count = config.health_check_concurrency.min(total).max(1);
     info!(
         target = %target.display,
+        expected_status = %target.expected_display,
         total_nodes = total,
         attempts,
         timeout_ms = config.health_check_timeout_ms,
@@ -393,9 +425,13 @@ async fn health_check_proxies(
                 };
 
                 let label = proxy.label();
-                if check_proxy_node(&proxy, &target, attempts, timeout).await {
-                    debug!(node = %label, "代理节点已加入活动代理池");
-                    active.push(proxy);
+                if let Some(delay) = check_proxy_node(&proxy, &target, attempts, timeout).await {
+                    debug!(
+                        node = %label,
+                        delay_ms = delay.as_millis(),
+                        "代理节点已加入活动代理池"
+                    );
+                    active.push(HealthyProxy { proxy, delay });
                 } else {
                     debug!(node = %label, "代理节点未通过健康检查");
                 }
@@ -404,7 +440,7 @@ async fn health_check_proxies(
         });
     }
 
-    let mut active = Vec::new();
+    let mut active: Vec<HealthyProxy> = Vec::new();
     while let Some(result) = checks.join_next().await {
         match result {
             Ok(mut worker_active) => active.append(&mut worker_active),
@@ -412,15 +448,34 @@ async fn health_check_proxies(
         }
     }
 
-    info!(
-        target = %target.display,
-        checked_nodes = total,
-        active_nodes = active.len(),
-        rejected_nodes = total.saturating_sub(active.len()),
-        concurrency = worker_count,
-        "批量健康检查完成"
-    );
-    Ok(active)
+    active.sort_by_key(|result| result.delay);
+    let stats = latency_stats(&active);
+    if let Some(stats) = stats {
+        info!(
+            target = %target.display,
+            expected_status = %target.expected_display,
+            checked_nodes = total,
+            active_nodes = active.len(),
+            rejected_nodes = total.saturating_sub(active.len()),
+            concurrency = worker_count,
+            min_delay_ms = stats.min_ms,
+            p50_delay_ms = stats.p50_ms,
+            p90_delay_ms = stats.p90_ms,
+            max_delay_ms = stats.max_ms,
+            "批量健康检查完成"
+        );
+    } else {
+        info!(
+            target = %target.display,
+            expected_status = %target.expected_display,
+            checked_nodes = total,
+            active_nodes = 0,
+            rejected_nodes = total,
+            concurrency = worker_count,
+            "批量健康检查完成"
+        );
+    }
+    Ok(active.into_iter().map(|result| result.proxy).collect())
 }
 
 async fn check_proxy_node(
@@ -428,23 +483,29 @@ async fn check_proxy_node(
     target: &HealthCheckTarget,
     attempts: usize,
     timeout: Duration,
-) -> bool {
+) -> Option<Duration> {
     let label = proxy.label();
     let mut last_error = None;
     for attempt in 1..=attempts {
         match run_health_check(proxy, target, timeout).await {
-            Ok(()) => {
+            Ok(delay) => {
                 if attempt == 1 {
-                    debug!(node = %label, target = %target.display, "代理健康检查通过");
+                    debug!(
+                        node = %label,
+                        target = %target.display,
+                        delay_ms = delay.as_millis(),
+                        "代理健康检查通过"
+                    );
                 } else {
                     debug!(
                         node = %label,
                         target = %target.display,
                         attempt,
+                        delay_ms = delay.as_millis(),
                         "代理重试后健康检查通过"
                     );
                 }
-                return true;
+                return Some(delay);
             }
             Err(err) => {
                 debug!(
@@ -467,21 +528,23 @@ async fn check_proxy_node(
             .map(ToString::to_string)
             .unwrap_or_else(|| "未知错误".to_owned())
     );
-    false
+    None
 }
 
 async fn run_health_check(
     proxy: &ProxyNode,
     target: &HealthCheckTarget,
     attempt_timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<Duration> {
+    let start = Instant::now();
     match timeout(
         attempt_timeout,
         run_health_check_inner(proxy, target, attempt_timeout),
     )
     .await
     {
-        Ok(result) => result,
+        Ok(Ok(())) => Ok(start.elapsed()),
+        Ok(Err(err)) => Err(err),
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("测活超时，耗时 {attempt_timeout:?}"),
@@ -513,10 +576,17 @@ async fn run_health_check_inner(
             read_health_status(&mut tls_stream).await?
         }
     };
-    if (200..400).contains(&status) {
+    if target
+        .expected_status
+        .iter()
+        .any(|range| range.contains(status))
+    {
         Ok(())
     } else {
-        Err(io::Error::other(format!("测活端点返回 HTTP {status}")))
+        Err(io::Error::other(format!(
+            "测活端点返回 HTTP {status}，期望 {}",
+            target.expected_display
+        )))
     }
 }
 
@@ -565,6 +635,33 @@ fn parse_http_status(header: &[u8]) -> io::Result<u16> {
     status
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "测活响应状态码无效"))
+}
+
+fn latency_stats(active: &[HealthyProxy]) -> Option<LatencyStats> {
+    if active.is_empty() {
+        return None;
+    }
+    let delays = active
+        .iter()
+        .map(|result| result.delay.as_millis())
+        .collect::<Vec<_>>();
+    Some(LatencyStats {
+        min_ms: *delays.first()?,
+        p50_ms: percentile(&delays, 50)?,
+        p90_ms: percentile(&delays, 90)?,
+        max_ms: *delays.last()?,
+    })
+}
+
+fn percentile(sorted_values: &[u128], percentile: usize) -> Option<u128> {
+    if sorted_values.is_empty() {
+        return None;
+    }
+    let index = (sorted_values.len() * percentile)
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(sorted_values.len() - 1);
+    sorted_values.get(index).copied()
 }
 
 #[cfg(test)]

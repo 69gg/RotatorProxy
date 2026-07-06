@@ -377,6 +377,7 @@ async fn health_refresh_filters_failed_proxy_and_swaps_pool() -> io::Result<()> 
     let config = AppConfig {
         proxy_dirs: vec![dir.path().to_path_buf()],
         health_check_url: format!("http://{target_addr}/health"),
+        health_check_expected_status: "200-399".to_owned(),
         health_check_attempts: 1,
         health_check_timeout_ms: 500,
         health_check_concurrency: 2,
@@ -414,6 +415,7 @@ async fn health_check_timeout_covers_stalled_response() -> io::Result<()> {
     let config = AppConfig {
         proxy_dirs: vec![dir.path().to_path_buf()],
         health_check_url: format!("http://{target_addr}/health"),
+        health_check_expected_status: "200-399".to_owned(),
         health_check_attempts: 1,
         health_check_timeout_ms: 100,
         health_check_concurrency: 1,
@@ -437,6 +439,40 @@ async fn health_check_timeout_covers_stalled_response() -> io::Result<()> {
 }
 
 #[tokio::test]
+async fn scheduled_refresh_keeps_previous_pool_when_all_new_nodes_fail() -> io::Result<()> {
+    let bad_port = unused_local_port().await?;
+
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(&proxy_file, format!("http://127.0.0.1:{bad_port}\n")).unwrap();
+
+    let previous = ProxyNode::Http {
+        addr: HostPort::new("127.0.0.1", 19090).unwrap(),
+        auth: None,
+    };
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_url: "http://127.0.0.1:9/health".to_owned(),
+        health_check_attempts: 1,
+        health_check_timeout_ms: 100,
+        health_check_concurrency: 1,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let pool = ProxyPool::with_runtime_options(vec![previous], 2, 3, Duration::from_secs(60));
+    let mihomo = MihomoManager::new();
+
+    let summary = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.loaded, 1);
+    assert_eq!(summary.active, 1);
+    assert_eq!(labels_from_pool(&pool), vec!["http://127.0.0.1:19090"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_refresh_accepts_https_proxy() -> io::Result<()> {
     let (target_addr, _first_line_rx, _target_handle) = spawn_http_target().await?;
     let (proxy_addr, _proxy_handle) = spawn_https_connect_proxy().await?;
@@ -455,6 +491,7 @@ async fn health_refresh_accepts_https_proxy() -> io::Result<()> {
     let config = AppConfig {
         proxy_dirs: vec![dir.path().to_path_buf()],
         health_check_url: format!("http://{target_addr}/health"),
+        health_check_expected_status: "200-399".to_owned(),
         health_check_attempts: 1,
         health_check_timeout_ms: 1000,
         health_check_concurrency: 1,
