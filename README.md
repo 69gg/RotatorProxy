@@ -139,7 +139,7 @@ RotatorProxy 不会监控输入目录变化。它只会在启动时和配置的�
 
 批量测活时，RotatorProxy 会通过每个候选节点向 `health_check_url` 发起 HTTP/HTTPS 请求，类似 Clash/Mihomo 的 URL delay 测试，而不是 ICMP ping。响应状态码必须匹配 `health_check_expected_status`。通过测活的节点会记录本次延迟，活动池按延迟从低到高排序后进入随机袋。HTTPS 测活默认校验证书；只有私有或自签测活端点才建议设置 `health_check_tls_skip_verify = true`。节点如果在配置次数内全部测活失败，就不会进入活动轮换池。
 
-设置 `health_check_enabled = false` 后，启动和刷新阶段不执行 URL delay 预检查，所有候选节点都会直接进入活动轮换池。正常转发流量时，已入池节点连接失败会按 `runtime_failure_threshold` 计数，达到阈值后进入 `cooldown_seconds` 冷却期并临时跳过。若同一刷新周期内同一节点达到 `runtime_disable_after_cooldowns` 次冷却阈值，该节点会被禁用到下一次刷新成功切换代理池。下一次订阅/来源刷新成功后，运行时失败状态会清空，节点可以重新参与轮换。
+设置 `health_check_enabled = false` 后，启动和刷新阶段不执行 URL delay 预检查，所有候选节点都会直接进入活动轮换池。正常转发流量时，已入池节点连接失败会按 `runtime_failure_threshold` 计数，达到阈值后进入 `cooldown_seconds` 冷却期并临时跳过。若代理连接已经建立，但在收到代理侧首个响应前发生协议读写错误或提前关闭，也会计入运行时失败；这可以覆盖 VLESS/VMess 等延迟读取服务端响应头的节点。若同一刷新周期内同一节点达到 `runtime_disable_after_cooldowns` 次冷却阈值，该节点会被禁用到下一次刷新成功切换代理池。下一次订阅/来源刷新成功后，运行时失败状态会清空，节点可以重新参与轮换。
 
 启动阶段如果没有任何健康节点，会按空活动池启动。定时刷新阶段如果新一轮测活没有任何健康节点，RotatorProxy 会保留上一版活动池继续服务，避免公开源短时波动把可用池清空。
 

@@ -1,7 +1,9 @@
 use std::{
     io,
     net::{IpAddr, Ipv4Addr},
+    pin::Pin,
     sync::{Arc, OnceLock},
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
 };
 
@@ -18,7 +20,7 @@ use shadowsocks::{
     context::{Context, SharedContext},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpStream, lookup_host},
     time::timeout,
 };
@@ -88,9 +90,9 @@ impl Connector {
                         upstream = %upstream,
                         target = %target,
                         elapsed_ms,
-                        "出站连接尝试成功"
+                        "出站连接已建立，进入转发阶段"
                     );
-                    return Ok(stream);
+                    return Ok(self.observe_runtime_stream(stream, &choice, target, attempt_no));
                 }
                 Ok(Err(err)) => {
                     let elapsed_ms = started_at.elapsed().as_millis();
@@ -152,6 +154,178 @@ impl Connector {
                 connect_proxy_node(&self.ss_context, entry.node.as_ref(), target).await
             }
         }
+    }
+
+    fn observe_runtime_stream(
+        &self,
+        stream: BoxedStream,
+        choice: &ProxyChoice,
+        target: &TargetAddr,
+        attempt: usize,
+    ) -> BoxedStream {
+        match choice {
+            ProxyChoice::Direct => stream,
+            ProxyChoice::Proxy(_) => Box::new(RuntimeObservedStream::new(
+                stream,
+                self.pool.clone(),
+                choice.clone(),
+                target,
+                attempt,
+            )),
+        }
+    }
+}
+
+struct RuntimeObservedStream {
+    inner: BoxedStream,
+    pool: ProxyPool,
+    choice: ProxyChoice,
+    node: String,
+    kind: &'static str,
+    upstream: String,
+    target: String,
+    attempt: usize,
+    response_seen: bool,
+    failure_reported: bool,
+    post_response_error_logged: bool,
+}
+
+impl RuntimeObservedStream {
+    fn new(
+        inner: BoxedStream,
+        pool: ProxyPool,
+        choice: ProxyChoice,
+        target: &TargetAddr,
+        attempt: usize,
+    ) -> Self {
+        Self {
+            inner,
+            pool,
+            node: choice.label(),
+            kind: choice.kind(),
+            upstream: choice.upstream_addr(target),
+            target: target.to_string(),
+            choice,
+            attempt,
+            response_seen: false,
+            failure_reported: false,
+            post_response_error_logged: false,
+        }
+    }
+
+    fn report_runtime_error(&mut self, operation: &'static str, err: &io::Error) {
+        if self.response_seen {
+            self.log_post_response_error(operation, err);
+            return;
+        }
+        self.report_pre_response_failure(operation, err.kind(), err);
+    }
+
+    fn report_pre_response_eof(&mut self, operation: &'static str) {
+        if self.response_seen {
+            return;
+        }
+        self.report_pre_response_failure(
+            operation,
+            io::ErrorKind::UnexpectedEof,
+            "代理连接在收到响应前关闭",
+        );
+    }
+
+    fn report_pre_response_failure(
+        &mut self,
+        operation: &'static str,
+        error_kind: io::ErrorKind,
+        error: impl std::fmt::Display,
+    ) {
+        if self.failure_reported {
+            return;
+        }
+        self.failure_reported = true;
+        warn!(
+            attempt = self.attempt,
+            node = %self.node,
+            kind = self.kind,
+            upstream = %self.upstream,
+            target = %self.target,
+            operation,
+            error_kind = ?error_kind,
+            error = %error,
+            "代理转发阶段在收到响应前失败，已计入运行时失败"
+        );
+        self.pool.report_failure(&self.choice);
+    }
+
+    fn log_post_response_error(&mut self, operation: &'static str, err: &io::Error) {
+        if self.post_response_error_logged {
+            return;
+        }
+        self.post_response_error_logged = true;
+        debug!(
+            attempt = self.attempt,
+            node = %self.node,
+            kind = self.kind,
+            upstream = %self.upstream,
+            target = %self.target,
+            operation,
+            error_kind = ?err.kind(),
+            error = %err,
+            "代理转发阶段在已收到响应后返回错误，不计入节点失败"
+        );
+    }
+}
+
+impl AsyncRead for RuntimeObservedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let had_capacity = buf.remaining() > 0;
+        let before = buf.filled().len();
+        let result = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        match &result {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before {
+                    self.response_seen = true;
+                } else if had_capacity {
+                    self.report_pre_response_eof("read");
+                }
+            }
+            Poll::Ready(Err(err)) => self.report_runtime_error("read", err),
+            Poll::Pending => {}
+        }
+        result
+    }
+}
+
+impl AsyncWrite for RuntimeObservedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut *self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Err(err)) = &result {
+            self.report_runtime_error("write", err);
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut *self.inner).poll_flush(cx);
+        if let Poll::Ready(Err(err)) = &result {
+            self.report_runtime_error("flush", err);
+        }
+        result
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut *self.inner).poll_shutdown(cx);
+        if let Poll::Ready(Err(err)) = &result {
+            self.report_runtime_error("shutdown", err);
+        }
+        result
     }
 }
 
@@ -674,6 +848,120 @@ async fn resolve_ipv4(target: &TargetAddr) -> io::Result<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReadErrorStream;
+
+    impl AsyncRead for ReadErrorStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("lazy response header failed")))
+        }
+    }
+
+    impl AsyncWrite for ReadErrorStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct ReadThenErrorStream {
+        returned_response: bool,
+    }
+
+    impl AsyncRead for ReadThenErrorStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.returned_response {
+                return Poll::Ready(Err(io::Error::other("late stream error")));
+            }
+            self.returned_response = true;
+            buf.put_slice(b"x");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ReadThenErrorStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn runtime_observed_test_pool() -> ProxyPool {
+        ProxyPool::with_runtime_failure_policy(
+            vec![ProxyNode::Http {
+                addr: HostPort::new("127.0.0.1", 8080).unwrap(),
+                auth: None,
+            }],
+            1,
+            1,
+            Duration::from_secs(60),
+            2,
+        )
+    }
+
+    #[tokio::test]
+    async fn runtime_stream_failure_before_response_cools_proxy() {
+        let pool = runtime_observed_test_pool();
+        let choice = pool.candidates().pop().unwrap();
+        let target = TargetAddr::new("example.com", 80).unwrap();
+        let mut stream =
+            RuntimeObservedStream::new(Box::new(ReadErrorStream), pool.clone(), choice, &target, 1);
+
+        let mut buffer = [0_u8; 1];
+        assert!(stream.read(&mut buffer).await.is_err());
+        assert!(pool.candidates().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_stream_error_after_response_does_not_cool_proxy() {
+        let pool = runtime_observed_test_pool();
+        let choice = pool.candidates().pop().unwrap();
+        let target = TargetAddr::new("example.com", 80).unwrap();
+        let mut stream = RuntimeObservedStream::new(
+            Box::new(ReadThenErrorStream {
+                returned_response: false,
+            }),
+            pool.clone(),
+            choice,
+            &target,
+            1,
+        );
+
+        let mut buffer = [0_u8; 1];
+        assert_eq!(stream.read(&mut buffer).await.unwrap(), 1);
+        assert!(stream.read(&mut buffer).await.is_err());
+        assert_eq!(pool.candidates().len(), 1);
+    }
 
     #[test]
     fn encodes_socks5_domain_address() {
