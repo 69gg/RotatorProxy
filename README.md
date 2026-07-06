@@ -123,11 +123,11 @@ proxies:
 
 ## Clash 兼容节点
 
-RotatorProxy 在进程内处理常见 TCP 代理协议。简单协议使用本地实现：HTTP、HTTPS、SOCKS4/5 和普通 Shadowsocks。复杂 Clash 兼容节点会优先交给内嵌 `meow-proxy` 后端构建。目前该路径覆盖 VMess、VLESS、Trojan、Hysteria2/Hy2、Snell、AnyTLS、Reality TLS、uTLS/client-fingerprint 配置，以及带受支持内置插件的 Shadowsocks。
+RotatorProxy 在进程内处理常见 TCP 代理协议。简单协议使用本地实现：HTTP、HTTPS、SOCKS4/5 和普通 Shadowsocks。复杂 Clash 兼容节点会优先交给内嵌 `meow-proxy` 后端构建。目前该路径覆盖 VMess、VLESS、Trojan、Trojan over WebSocket/HTTPUpgrade/gRPC/H2、Hysteria2/Hy2、Snell、AnyTLS、Reality TLS、uTLS/client-fingerprint 配置，以及带受支持内置插件的 Shadowsocks。VLESS 的 `xtls-rprx-vision-*` 后缀会按 TCP 场景归一化为 `xtls-rprx-vision`。
 
 Reality 和真实 uTLS/client-fingerprint 支持使用 `meow-transport` 的 BoringSSL TLS 路径，仍在 Rust 进程内完成。此类节点不需要外部 Mihomo 二进制，但 Linux 构建需要 `boring-sys` 所需的常规原生工具链。
 
-当节点使用内嵌后端无法可靠复现的字段或协议时，例如 TUIC、WireGuard/WG、Mieru、SSH 或 SSR，该节点会进入可选 Mihomo fallback 队列。Mihomo fallback 默认关闭。在默认配置下，只有 fallback 才能支持的节点会被记录日志并跳过，不会启动或下载外部可执行文件。
+当节点使用内嵌后端无法可靠复现的字段或协议时，例如 TUIC、WireGuard/WG、Mieru、SSH、SSR、旧版 VMess `alterId` 或 XHTTP，该节点会进入可选 Mihomo fallback 队列。Mihomo fallback 默认关闭。在默认配置下，只有 fallback 才能支持的节点会被记录日志并跳过，不会启动或下载外部可执行文件。
 
 如果设置 `mihomo_enabled = true`，RotatorProxy 会为每个 fallback 节点生成一个本地 Mihomo `mixed` 监听器，绑定到 `127.0.0.1`，并把该监听器的 `proxy` 字段固定到一个内部代理名。轮换器随后把这个监听器当作普通出站候选节点处理。这样可以避免全局 selector 切换，并让并发请求稳定绑定到轮换器选择的节点。fallback 节点会按 `mihomo_generation_batch_size` 拆成多个 Mihomo 进程，避免一次在单个进程里打开几千个监听器。如果预留本地监听端口时遇到 `Too many open files`，当前刷新会自动缩小 Mihomo 批次并重试；仍然失败时，可以降低 `mihomo_generation_batch_size` 或调高 `ulimit -n`。
 

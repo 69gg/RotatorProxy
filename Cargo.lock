@@ -2363,6 +2363,7 @@ name = "rotator-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "chrono",
  "flate2",
@@ -2377,6 +2378,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "shadowsocks",
  "tempfile",
  "thiserror 2.0.18",

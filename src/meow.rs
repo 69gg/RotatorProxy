@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use base64::{
     Engine as _,
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
 };
-use meow_common::ProxyAdapter;
+use meow_common::{
+    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn,
+};
 use meow_proxy::{
     AnytlsAdapter, Hy2Adapter, Hy2HopInterval, Hy2Obfs, Hy2Options, ShadowsocksAdapter,
-    SnellAdapter, SnellObfs, SnellVersion, TrojanAdapter, VlessAdapter, VlessFlow, VmessAdapter,
-    shadowsocks_adapter::is_builtin_obfs_plugin,
+    SnellAdapter, SnellObfs, SnellVersion, StreamConn, TrojanAdapter, VlessAdapter, VlessFlow,
+    VmessAdapter, shadowsocks_adapter::is_builtin_obfs_plugin,
 };
 use meow_transport::{
     grpc::{GrpcConfig, GrpcLayer},
@@ -19,6 +22,8 @@ use meow_transport::{
     ws::{WsConfig, WsLayer},
 };
 use rustls::pki_types::ServerName;
+use sha2::{Digest, Sha224};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -30,6 +35,147 @@ use crate::{
 pub struct MeowBuildResult {
     pub nodes: Vec<ProxyNode>,
     pub fallback: Vec<MihomoProxyConfig>,
+}
+
+const TROJAN_CMD_CONNECT: u8 = 0x01;
+const SOCKS_ATYP_IPV4: u8 = 0x01;
+const SOCKS_ATYP_DOMAIN: u8 = 0x03;
+const SOCKS_ATYP_IPV6: u8 = 0x04;
+
+struct TrojanTransportAdapter {
+    name: String,
+    server: String,
+    port: u16,
+    addr: String,
+    hex_password: String,
+    transport: meow_proxy::TransportChain,
+    health: ProxyHealth,
+}
+
+impl TrojanTransportAdapter {
+    fn new(
+        name: String,
+        server: String,
+        port: u16,
+        password: &str,
+        transport: meow_proxy::TransportChain,
+    ) -> Self {
+        let mut hasher = Sha224::new();
+        hasher.update(password.as_bytes());
+        let hex_password = hex_lower(&hasher.finalize());
+        let addr = format!("{server}:{port}");
+        Self {
+            name,
+            server,
+            port,
+            addr,
+            hex_password,
+            transport,
+            health: ProxyHealth::new(),
+        }
+    }
+
+    fn build_header(&self, metadata: &Metadata) -> meow_common::Result<Vec<u8>> {
+        let mut header = Vec::with_capacity(320);
+        header.extend_from_slice(self.hex_password.as_bytes());
+        header.extend_from_slice(b"\r\n");
+        header.push(TROJAN_CMD_CONNECT);
+        encode_socks_addr_from_metadata(&mut header, metadata)?;
+        header.extend_from_slice(b"\r\n");
+        Ok(header)
+    }
+}
+
+#[async_trait]
+impl ProxyAdapter for TrojanTransportAdapter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn adapter_type(&self) -> AdapterType {
+        AdapterType::Trojan
+    }
+
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    fn support_udp(&self) -> bool {
+        false
+    }
+
+    async fn dial_tcp(&self, metadata: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+        debug!(
+            "Trojan transport connecting to {} via {}",
+            metadata.remote_address(),
+            self.addr
+        );
+        let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+            .await
+            .map_err(MeowError::Io)?;
+        let mut stream = self.transport.connect(Box::new(tcp)).await?;
+        let header = self.build_header(metadata)?;
+        stream.write_all(&header).await.map_err(MeowError::Io)?;
+        Ok(Box::new(StreamConn(stream)))
+    }
+
+    async fn dial_udp(
+        &self,
+        _metadata: &Metadata,
+    ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+        Err(MeowError::NotSupported(
+            "Trojan transport UDP is not supported by RotatorProxy".to_owned(),
+        ))
+    }
+
+    fn health(&self) -> &ProxyHealth {
+        &self.health
+    }
+}
+
+fn encode_socks_addr_from_metadata(
+    out: &mut Vec<u8>,
+    metadata: &Metadata,
+) -> meow_common::Result<()> {
+    if !metadata.host.is_empty() {
+        let host = metadata.host.as_bytes();
+        if host.len() > u8::MAX as usize {
+            return Err(MeowError::Proxy(format!(
+                "trojan: domain name too long ({} > {})",
+                host.len(),
+                u8::MAX
+            )));
+        }
+        out.push(SOCKS_ATYP_DOMAIN);
+        out.push(host.len() as u8);
+        out.extend_from_slice(host);
+    } else if let Some(ip) = metadata.dst_ip {
+        match ip {
+            std::net::IpAddr::V4(ip) => {
+                out.push(SOCKS_ATYP_IPV4);
+                out.extend_from_slice(&ip.octets());
+            }
+            std::net::IpAddr::V6(ip) => {
+                out.push(SOCKS_ATYP_IPV6);
+                out.extend_from_slice(&ip.octets());
+            }
+        }
+    } else {
+        out.push(SOCKS_ATYP_IPV4);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+    }
+    out.extend_from_slice(&metadata.dst_port.to_be_bytes());
+    Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
@@ -125,11 +271,7 @@ fn build_vless(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Resu
     {
         bail!("不支持的 VLESS encryption：{encryption}");
     }
-    let flow = match string_field(mapping, &["flow"]).as_deref() {
-        Some("xtls-rprx-vision") => Some(VlessFlow::XtlsRprxVision),
-        Some(other) => bail!("不支持的 VLESS flow：{other}"),
-        None => None,
-    };
+    let flow = parse_vless_flow(mapping)?;
     let transport = build_transport_chain(mapping, &server)?;
     let adapter = VlessAdapter::new(
         &name,
@@ -147,15 +289,16 @@ fn build_trojan(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Res
     let name = node_name(proxy, mapping);
     let server = required_string(mapping, &["server"], &name)?;
     let port = required_port(mapping, &["port"], &name)?;
-    let network = string_field(mapping, &["network", "type"])
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(network.as_str(), "" | "tcp" | "trojan") {
-        bail!("Trojan over {network} 需要 Mihomo fallback");
-    }
+    let network = transport_network(mapping);
     let password = required_string(mapping, &["password"], &name)?;
     let sni = string_field(mapping, &["sni", "servername"]).unwrap_or_else(|| server.clone());
     validate_tls_server_name(&sni)?;
+    if !matches!(network.as_str(), "" | "tcp" | "trojan") {
+        let transport = build_trojan_transport_chain(mapping, &server, &sni)?;
+        let adapter =
+            TrojanTransportAdapter::new(name.clone(), server.clone(), port, &password, transport);
+        return Ok(meow_node(proxy, name, server, port, Arc::new(adapter)));
+    }
     let adapter = TrojanAdapter::new(
         &name,
         &server,
@@ -281,23 +424,53 @@ fn build_transport_chain(
     let mut chain = meow_proxy::transport_chain::TransportChain::empty();
     let reality = parse_reality_config(mapping)?;
     if bool_field(mapping, &["tls"]).unwrap_or(false) || reality.is_some() {
-        let mut config = TlsConfig::new(
+        push_tls_layer(
+            &mut chain,
+            mapping,
             string_field(mapping, &["servername", "sni"]).unwrap_or_else(|| server.to_owned()),
-        );
-        config.skip_cert_verify =
-            bool_field(mapping, &["skip-cert-verify", "allow-insecure"]).unwrap_or(false);
-        config.alpn = string_list_field(mapping, &["alpn"]).unwrap_or_default();
-        config.fingerprint = string_field(mapping, &["client-fingerprint", "fingerprint"]);
-        config.reality = reality;
-        let layer = TlsLayer::new(&config).map_err(|err| anyhow!("{err}"))?;
-        chain.push(Box::new(layer));
+            reality,
+        )?;
     }
+    push_transport_layers(&mut chain, mapping, server)?;
+    Ok(chain)
+}
 
-    let network = string_field(mapping, &["network", "type"])
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+fn build_trojan_transport_chain(
+    mapping: &serde_yaml::Mapping,
+    server: &str,
+    sni: &str,
+) -> Result<meow_proxy::transport_chain::TransportChain> {
+    let mut chain = meow_proxy::transport_chain::TransportChain::empty();
+    push_tls_layer(&mut chain, mapping, sni.to_owned(), None)?;
+    push_transport_layers(&mut chain, mapping, server)?;
+    Ok(chain)
+}
+
+fn push_tls_layer(
+    chain: &mut meow_proxy::transport_chain::TransportChain,
+    mapping: &serde_yaml::Mapping,
+    server_name: String,
+    reality: Option<RealityConfig>,
+) -> Result<()> {
+    let mut config = TlsConfig::new(server_name);
+    config.skip_cert_verify =
+        bool_field(mapping, &["skip-cert-verify", "allow-insecure"]).unwrap_or(false);
+    config.alpn = string_list_field(mapping, &["alpn"]).unwrap_or_default();
+    config.fingerprint = string_field(mapping, &["client-fingerprint", "fingerprint"]);
+    config.reality = reality;
+    let layer = TlsLayer::new(&config).map_err(|err| anyhow!("{err}"))?;
+    chain.push(Box::new(layer));
+    Ok(())
+}
+
+fn push_transport_layers(
+    chain: &mut meow_proxy::transport_chain::TransportChain,
+    mapping: &serde_yaml::Mapping,
+    server: &str,
+) -> Result<()> {
+    let network = transport_network(mapping);
     match network.as_str() {
-        "" | "tcp" | "vmess" | "vless" => {}
+        "" | "tcp" | "vmess" | "vless" | "trojan" => {}
         "ws" | "websocket" => {
             let options = mapping_field(mapping, "ws-opts");
             let host_header = string_field_in(options, &["host"])
@@ -350,7 +523,13 @@ fn build_transport_chain(
         }
         other => bail!("不支持的传输网络：{other}"),
     }
-    Ok(chain)
+    Ok(())
+}
+
+fn transport_network(mapping: &serde_yaml::Mapping) -> String {
+    string_field(mapping, &["network", "type"])
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 fn meow_node(
@@ -384,6 +563,19 @@ fn required_string(mapping: &serde_yaml::Mapping, keys: &[&str], name: &str) -> 
 
 fn required_port(mapping: &serde_yaml::Mapping, keys: &[&str], name: &str) -> Result<u16> {
     u16_field(mapping, keys).ok_or_else(|| anyhow!("代理 {name} 缺少 {}", keys.join("/")))
+}
+
+fn parse_vless_flow(mapping: &serde_yaml::Mapping) -> Result<Option<VlessFlow>> {
+    let Some(flow) = string_field(mapping, &["flow"]) else {
+        return Ok(None);
+    };
+    let flow = flow.to_ascii_lowercase();
+    match flow.as_str() {
+        "" | "none" => Ok(None),
+        "xtls-rprx-vision" => Ok(Some(VlessFlow::XtlsRprxVision)),
+        value if value.starts_with("xtls-rprx-vision-") => Ok(Some(VlessFlow::XtlsRprxVision)),
+        other => bail!("不支持的 VLESS flow：{other}"),
+    }
 }
 
 fn uuid_bytes(value: &str) -> Result<[u8; 16]> {
@@ -713,6 +905,47 @@ client-fingerprint: chrome
         let result = build_meow_nodes(vec![proxy]);
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.fallback.len(), 0);
+    }
+
+    #[test]
+    fn normalizes_vless_vision_udp443_flow_suffix() {
+        let proxy = complex(
+            r#"
+name: vless-vision-udp443
+type: vless
+server: example.com
+port: 443
+uuid: 00000000-0000-0000-0000-000000000000
+tls: true
+flow: xtls-rprx-vision-udp443
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
+    }
+
+    #[test]
+    fn builds_trojan_websocket_transport_adapter() {
+        let proxy = complex(
+            r#"
+name: trojan-ws
+type: trojan
+server: example.com
+port: 443
+password: pass
+sni: example.com
+network: ws
+ws-opts:
+  path: /ws
+  headers:
+    Host: cdn.example.com
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
+        assert_eq!(result.nodes[0].label(), "meow:trojan:trojan-ws");
     }
 
     #[test]
