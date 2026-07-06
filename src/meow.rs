@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+};
 use meow_common::ProxyAdapter;
 use meow_proxy::{
     AnytlsAdapter, Hy2Adapter, Hy2HopInterval, Hy2Obfs, Hy2Options, ShadowsocksAdapter,
@@ -11,7 +15,7 @@ use meow_transport::{
     grpc::{GrpcConfig, GrpcLayer},
     h2::{H2Config, H2Layer},
     httpupgrade::{HttpUpgradeConfig, HttpUpgradeLayer},
-    tls::{TlsConfig, TlsLayer},
+    tls::{RealityConfig, TlsConfig, TlsLayer},
     ws::{WsConfig, WsLayer},
 };
 use tracing::{debug, warn};
@@ -28,7 +32,7 @@ pub struct MeowBuildResult {
 }
 
 pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
-    let mut nodes = Vec::new();
+    let mut nodes = Vec::with_capacity(proxies.len());
     let mut fallback = Vec::new();
 
     for proxy in proxies {
@@ -265,21 +269,17 @@ fn build_transport_chain(
     mapping: &serde_yaml::Mapping,
     server: &str,
 ) -> Result<meow_proxy::transport_chain::TransportChain> {
-    if get(mapping, "reality-opts").is_some() {
-        bail!("reality-opts requires mihomo fallback in this build");
-    }
-    if string_field(mapping, &["client-fingerprint", "fingerprint"]).is_some() {
-        bail!("client fingerprint requires mihomo fallback in this build");
-    }
-
     let mut chain = meow_proxy::transport_chain::TransportChain::empty();
-    if bool_field(mapping, &["tls"]).unwrap_or(false) {
+    let reality = parse_reality_config(mapping)?;
+    if bool_field(mapping, &["tls"]).unwrap_or(false) || reality.is_some() {
         let mut config = TlsConfig::new(
             string_field(mapping, &["servername", "sni"]).unwrap_or_else(|| server.to_owned()),
         );
         config.skip_cert_verify =
             bool_field(mapping, &["skip-cert-verify", "allow-insecure"]).unwrap_or(false);
         config.alpn = string_list_field(mapping, &["alpn"]).unwrap_or_default();
+        config.fingerprint = string_field(mapping, &["client-fingerprint", "fingerprint"]);
+        config.reality = reality;
         let layer = TlsLayer::new(&config).map_err(|err| anyhow!("{err}"))?;
         chain.push(Box::new(layer));
     }
@@ -411,6 +411,78 @@ fn parse_snell_obfs(mapping: &serde_yaml::Mapping, server: &str) -> Result<Snell
     }
 }
 
+fn parse_reality_config(mapping: &serde_yaml::Mapping) -> Result<Option<RealityConfig>> {
+    let Some(options) = mapping_field(mapping, "reality-opts") else {
+        return Ok(None);
+    };
+    let public_key = string_field_in(Some(options), &["public-key", "public_key", "pbk"])
+        .ok_or_else(|| anyhow!("reality-opts missing public-key"))?;
+    Ok(Some(RealityConfig {
+        public_key: decode_reality_public_key(&public_key)?,
+        short_id: decode_reality_short_id(
+            &string_field_in(Some(options), &["short-id", "short_id", "sid"]).unwrap_or_default(),
+        )?,
+        support_x25519_mlkem768: bool_field_in(
+            Some(options),
+            &[
+                "support-x25519-mlkem768",
+                "support_x25519_mlkem768",
+                "x25519-mlkem768",
+            ],
+        )
+        .unwrap_or(false),
+    }))
+}
+
+fn decode_reality_public_key(value: &str) -> Result<[u8; 32]> {
+    let value = value.trim();
+    for engine in [&URL_SAFE_NO_PAD, &URL_SAFE] {
+        let Ok(decoded) = engine.decode(value.as_bytes()) else {
+            continue;
+        };
+        return decoded.try_into().map_err(|decoded: Vec<u8>| {
+            anyhow!(
+                "reality public-key must decode to 32 bytes, got {}",
+                decoded.len()
+            )
+        });
+    }
+    bail!("invalid reality public-key base64")
+}
+
+fn decode_reality_short_id(value: &str) -> Result<[u8; 8]> {
+    let bytes = decode_hex(value.trim()).context("invalid reality short-id hex")?;
+    if bytes.len() > 8 {
+        bail!("reality short-id must be at most 8 bytes");
+    }
+    let mut short_id = [0_u8; 8];
+    short_id[..bytes.len()].copy_from_slice(&bytes);
+    Ok(short_id)
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !value.len().is_multiple_of(2) {
+        bail!("hex string must have an even length");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Ok((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?))
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => bail!("invalid hex digit {}", byte as char),
+    }
+}
+
 fn get<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
     mapping.get(serde_yaml::Value::String(key.to_owned()))
 }
@@ -461,6 +533,11 @@ fn headers_from_mapping(mapping: Option<&serde_yaml::Mapping>) -> Vec<(String, S
 }
 
 fn bool_field(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<bool> {
+    bool_field_in(Some(mapping), keys)
+}
+
+fn bool_field_in(mapping: Option<&serde_yaml::Mapping>, keys: &[&str]) -> Option<bool> {
+    let mapping = mapping?;
     keys.iter()
         .find_map(|key| value_to_bool(get(mapping, key)?))
 }
@@ -573,7 +650,45 @@ port: 443
     }
 
     #[test]
-    fn reality_vless_falls_back() {
+    fn builds_reality_vless_adapter() {
+        let proxy = complex(
+            r#"
+name: vless-reality
+type: vless
+server: example.com
+port: 443
+uuid: 00000000-0000-0000-0000-000000000000
+tls: true
+reality-opts:
+  public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  short-id: 0123456789abcdef
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
+    }
+
+    #[test]
+    fn builds_client_fingerprint_adapter() {
+        let proxy = complex(
+            r#"
+name: vless-fp
+type: vless
+server: example.com
+port: 443
+uuid: 00000000-0000-0000-0000-000000000000
+tls: true
+client-fingerprint: chrome
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
+    }
+
+    #[test]
+    fn invalid_reality_public_key_falls_back() {
         let proxy = complex(
             r#"
 name: vless-reality

@@ -18,6 +18,7 @@ const DEFAULT_HEALTH_CHECK_URL: &str = "http://example.com/";
 const DEFAULT_HEALTH_CHECK_ATTEMPTS: usize = 3;
 const DEFAULT_HEALTH_CHECK_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_HEALTH_CHECK_CONCURRENCY: usize = 32;
+const DEFAULT_HEALTH_CHECK_TLS_SKIP_VERIFY: bool = false;
 const DEFAULT_RUNTIME_FAILURE_THRESHOLD: usize = 3;
 const DEFAULT_COOLDOWN_SECONDS: u64 = 300;
 const DEFAULT_DAILY_REFRESH_TIME: &str = "04:00";
@@ -42,6 +43,7 @@ pub struct AppConfig {
     pub health_check_attempts: usize,
     pub health_check_timeout_ms: u64,
     pub health_check_concurrency: usize,
+    pub health_check_tls_skip_verify: bool,
     pub runtime_failure_threshold: usize,
     pub cooldown_seconds: u64,
     pub daily_refresh_time: String,
@@ -68,6 +70,7 @@ impl Default for AppConfig {
             health_check_attempts: DEFAULT_HEALTH_CHECK_ATTEMPTS,
             health_check_timeout_ms: DEFAULT_HEALTH_CHECK_TIMEOUT_MS,
             health_check_concurrency: DEFAULT_HEALTH_CHECK_CONCURRENCY,
+            health_check_tls_skip_verify: DEFAULT_HEALTH_CHECK_TLS_SKIP_VERIFY,
             runtime_failure_threshold: DEFAULT_RUNTIME_FAILURE_THRESHOLD,
             cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
             daily_refresh_time: DEFAULT_DAILY_REFRESH_TIME.to_owned(),
@@ -108,8 +111,8 @@ impl AppConfig {
         }
         let health_url = Url::parse(&self.health_check_url)
             .with_context(|| format!("invalid health_check_url {}", self.health_check_url))?;
-        if health_url.scheme() != "http" {
-            bail!("health_check_url currently supports only http:// URLs");
+        if !matches!(health_url.scheme(), "http" | "https") {
+            bail!("health_check_url supports only http:// or https:// URLs");
         }
         if health_url.host_str().is_none() {
             bail!("health_check_url must include a host");
@@ -208,9 +211,18 @@ proxy_dirs = ["./fixtures"]
     }
 
     #[test]
-    fn rejects_https_health_check_url() {
+    fn accepts_https_health_check_url() {
         let config = AppConfig {
             health_check_url: "https://example.com/".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_health_check_url_scheme() {
+        let config = AppConfig {
+            health_check_url: "ftp://example.com/".to_owned(),
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());

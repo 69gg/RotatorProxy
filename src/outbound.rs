@@ -53,11 +53,7 @@ impl Connector {
 
         for choice in candidates {
             let label = choice.label();
-            let attempt = timeout(
-                self.connect_timeout,
-                self.connect_once(choice.clone(), target),
-            )
-            .await;
+            let attempt = timeout(self.connect_timeout, self.connect_once(&choice, target)).await;
             match attempt {
                 Ok(Ok(stream)) => {
                     self.pool.report_success(&choice);
@@ -86,20 +82,20 @@ impl Connector {
 
     async fn connect_once(
         &self,
-        choice: ProxyChoice,
+        choice: &ProxyChoice,
         target: &TargetAddr,
     ) -> io::Result<BoxedStream> {
         match choice {
             ProxyChoice::Direct => connect_direct(target).await,
             ProxyChoice::Proxy(entry) => {
-                connect_proxy_node(&self.ss_context, entry.node, target).await
+                connect_proxy_node(&self.ss_context, entry.node.as_ref(), target).await
             }
         }
     }
 }
 
 pub async fn connect_via_proxy_node(
-    proxy: ProxyNode,
+    proxy: &ProxyNode,
     target: &TargetAddr,
     connect_timeout: Duration,
 ) -> io::Result<BoxedStream> {
@@ -115,21 +111,21 @@ pub async fn connect_via_proxy_node(
 
 async fn connect_proxy_node(
     ss_context: &SharedContext,
-    proxy: ProxyNode,
+    proxy: &ProxyNode,
     target: &TargetAddr,
 ) -> io::Result<BoxedStream> {
     match proxy {
-        ProxyNode::Http { addr, auth } => connect_http_proxy(&addr, auth.as_ref(), target).await,
+        ProxyNode::Http { addr, auth } => connect_http_proxy(addr, auth.as_ref(), target).await,
         ProxyNode::Socks5 {
             addr,
             auth,
             remote_dns,
-        } => connect_socks5_proxy(&addr, auth.as_ref(), remote_dns, target).await,
+        } => connect_socks5_proxy(addr, auth.as_ref(), *remote_dns, target).await,
         ProxyNode::Socks4 {
             addr,
             auth,
             remote_dns,
-        } => connect_socks4_proxy(&addr, auth.as_ref(), remote_dns, target).await,
+        } => connect_socks4_proxy(addr, auth.as_ref(), *remote_dns, target).await,
         ProxyNode::Shadowsocks { server, .. } => {
             let stream = ProxyClientStream::connect(
                 ss_context.clone(),
@@ -139,7 +135,7 @@ async fn connect_proxy_node(
             .await?;
             Ok(Box::new(stream))
         }
-        ProxyNode::LocalMihomo { addr, .. } => connect_http_proxy(&addr, None, target).await,
+        ProxyNode::LocalMihomo { addr, .. } => connect_http_proxy(addr, None, target).await,
         ProxyNode::Meow(node) => {
             let metadata = metadata_from_target(target);
             let stream = node

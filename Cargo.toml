@@ -12,20 +12,24 @@ chrono = "0.4.40"
 flate2 = "1.0.35"
 meow-common = "0.16.0"
 meow-proxy = { version = "0.16.0", default-features = false, features = ["ss", "trojan", "vless", "vless-vision", "vmess", "snell", "hysteria2", "anytls"] }
-meow-transport = { version = "0.16.0", features = ["tls", "ws", "grpc", "h2", "httpupgrade"] }
+meow-transport = { version = "0.16.0", features = ["tls", "boring-tls", "ws", "grpc", "h2", "httpupgrade"] }
 percent-encoding = "2.3.1"
 reqwest = "0.13.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 serde_yaml = "0.9.34"
 shadowsocks = { version = "1.24.0", default-features = false, features = ["aead-cipher", "stream-cipher"] }
 thiserror = "2.0.11"
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26"
 toml = "1.1.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 url = "2.5.4"
 uuid = "1.11.0"
+webpki-roots = "1.0"
 
 [dev-dependencies]
+rcgen = "0.14"
 tempfile = "3.14.0"

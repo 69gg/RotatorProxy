@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fmt,
+    hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, RwLock,
@@ -13,6 +14,8 @@ use anyhow::{Result, anyhow, bail};
 use meow_common::ProxyAdapter;
 use shadowsocks::{ServerConfig, relay::socks5::Address as ShadowAddress};
 use tracing::{debug, info, warn};
+
+const FAILURE_SHARDS: usize = 64;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HostPort {
@@ -228,7 +231,7 @@ impl fmt::Display for TargetAddr {
 #[derive(Debug, Clone)]
 pub enum ProxyChoice {
     Direct,
-    Proxy(ProxyEntry),
+    Proxy(Arc<ProxyEntry>),
 }
 
 impl ProxyChoice {
@@ -244,15 +247,17 @@ impl ProxyChoice {
 pub struct ProxyEntry {
     pub key: String,
     pub label: String,
-    pub node: ProxyNode,
+    pub node: Arc<ProxyNode>,
 }
 
 impl ProxyEntry {
     fn from_node(node: ProxyNode) -> Self {
+        let key = node.key();
+        let label = node.label();
         Self {
-            key: node.key(),
-            label: node.label(),
-            node,
+            key,
+            label,
+            node: Arc::new(node),
         }
     }
 }
@@ -264,12 +269,12 @@ pub struct ProxyPool {
 
 #[derive(Debug)]
 struct ProxyPoolInner {
-    proxies: RwLock<Arc<Vec<ProxyEntry>>>,
+    proxies: RwLock<Arc<Vec<Arc<ProxyEntry>>>>,
     next: AtomicUsize,
     max_retries: usize,
     runtime_failure_threshold: usize,
     cooldown: Duration,
-    failures: Mutex<HashMap<String, FailureRecord>>,
+    failures: Vec<Mutex<HashMap<String, FailureRecord>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,7 +301,9 @@ impl ProxyPool {
                 max_retries: max_retries.max(1),
                 runtime_failure_threshold: runtime_failure_threshold.max(1),
                 cooldown,
-                failures: Mutex::new(HashMap::new()),
+                failures: (0..FAILURE_SHARDS)
+                    .map(|_| Mutex::new(HashMap::new()))
+                    .collect(),
             }),
         }
     }
@@ -321,12 +328,8 @@ impl ProxyPool {
                 .expect("proxy pool lock poisoned");
             *guard = Arc::new(entries);
         }
-        {
-            let mut failures = self
-                .inner
-                .failures
-                .lock()
-                .expect("proxy failure lock poisoned");
+        for shard in &self.inner.failures {
+            let mut failures = shard.lock().expect("proxy failure lock poisoned");
             failures.retain(|key, _| live_keys.contains(key));
         }
         info!("active proxy pool swapped, active_nodes={new_len}");
@@ -342,19 +345,14 @@ impl ProxyPool {
         let start = self.inner.next.fetch_add(1, Ordering::Relaxed) % len;
         let limit = self.inner.max_retries.min(len);
         let now = Instant::now();
-        let mut failures = self
-            .inner
-            .failures
-            .lock()
-            .expect("proxy failure lock poisoned");
         let mut choices = Vec::with_capacity(limit);
 
         for offset in 0..len {
             if choices.len() == limit {
                 break;
             }
-            let entry = proxies[(start + offset) % len].clone();
-            if is_in_cooldown(&mut failures, &entry, now) {
+            let entry = Arc::clone(&proxies[(start + offset) % len]);
+            if self.is_in_cooldown(&entry, now) {
                 continue;
             }
             choices.push(ProxyChoice::Proxy(entry));
@@ -367,11 +365,7 @@ impl ProxyPool {
         let ProxyChoice::Proxy(entry) = choice else {
             return;
         };
-        let mut failures = self
-            .inner
-            .failures
-            .lock()
-            .expect("proxy failure lock poisoned");
+        let mut failures = self.failure_shard(&entry.key);
         if failures.remove(&entry.key).is_some() {
             debug!(node = %entry.label, "proxy runtime failure counter reset after success");
         }
@@ -382,11 +376,7 @@ impl ProxyPool {
             return;
         };
         let now = Instant::now();
-        let mut failures = self
-            .inner
-            .failures
-            .lock()
-            .expect("proxy failure lock poisoned");
+        let mut failures = self.failure_shard(&entry.key);
         let record = failures.entry(entry.key.clone()).or_insert(FailureRecord {
             failures: 0,
             cooldown_until: None,
@@ -415,12 +405,38 @@ impl ProxyPool {
         }
     }
 
-    fn snapshot(&self) -> Arc<Vec<ProxyEntry>> {
+    fn snapshot(&self) -> Arc<Vec<Arc<ProxyEntry>>> {
         self.inner
             .proxies
             .read()
             .expect("proxy pool lock poisoned")
             .clone()
+    }
+
+    fn failure_shard(
+        &self,
+        key: &str,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, FailureRecord>> {
+        self.inner.failures[failure_shard_index(key)]
+            .lock()
+            .expect("proxy failure lock poisoned")
+    }
+
+    fn is_in_cooldown(&self, entry: &ProxyEntry, now: Instant) -> bool {
+        let mut failures = self.failure_shard(&entry.key);
+        let Some(record) = failures.get(&entry.key) else {
+            return false;
+        };
+        let Some(until) = record.cooldown_until else {
+            return false;
+        };
+        if until > now {
+            debug!(node = %entry.label, "skipping proxy in cooldown");
+            return true;
+        }
+        failures.remove(&entry.key);
+        debug!(node = %entry.label, "proxy cooldown expired");
+        false
     }
 }
 
@@ -432,28 +448,17 @@ impl Clone for ProxyPool {
     }
 }
 
-fn entries_from_nodes(proxies: Vec<ProxyNode>) -> Vec<ProxyEntry> {
-    proxies.into_iter().map(ProxyEntry::from_node).collect()
+fn entries_from_nodes(proxies: Vec<ProxyNode>) -> Vec<Arc<ProxyEntry>> {
+    proxies
+        .into_iter()
+        .map(|node| Arc::new(ProxyEntry::from_node(node)))
+        .collect()
 }
 
-fn is_in_cooldown(
-    failures: &mut HashMap<String, FailureRecord>,
-    entry: &ProxyEntry,
-    now: Instant,
-) -> bool {
-    let Some(record) = failures.get(&entry.key) else {
-        return false;
-    };
-    let Some(until) = record.cooldown_until else {
-        return false;
-    };
-    if until > now {
-        debug!(node = %entry.label, "skipping proxy in cooldown");
-        return true;
-    }
-    failures.remove(&entry.key);
-    debug!(node = %entry.label, "proxy cooldown expired");
-    false
+fn failure_shard_index(key: &str) -> usize {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % FAILURE_SHARDS
 }
 
 #[cfg(test)]
@@ -489,7 +494,7 @@ mod tests {
             .into_iter()
             .map(|choice| match choice {
                 ProxyChoice::Direct => "direct".to_owned(),
-                ProxyChoice::Proxy(entry) => entry.label,
+                ProxyChoice::Proxy(entry) => entry.label.clone(),
             })
             .collect();
         assert_eq!(labels, vec!["http://127.0.0.1:1", "http://127.0.0.1:2"]);
@@ -499,7 +504,7 @@ mod tests {
             .into_iter()
             .map(|choice| match choice {
                 ProxyChoice::Direct => "direct".to_owned(),
-                ProxyChoice::Proxy(entry) => entry.label,
+                ProxyChoice::Proxy(entry) => entry.label.clone(),
             })
             .collect();
         assert_eq!(labels, vec!["http://127.0.0.1:2", "http://127.0.0.1:3"]);

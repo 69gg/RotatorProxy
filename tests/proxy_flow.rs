@@ -1,15 +1,18 @@
-use std::{fs, io, net::SocketAddr, time::Duration};
+use std::{fs, io, net::SocketAddr, sync::Arc, time::Duration};
 
+use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rotator_proxy::{
     AppConfig, HostPort, MihomoManager, ProxyNode, ProxyPool, health::refresh_proxy_pool,
     outbound::Connector, server::run_listener,
 };
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
 };
+use tokio_rustls::TlsAcceptor;
 
 fn direct_connector() -> Connector {
     Connector::new(ProxyPool::new(Vec::new(), 10), Duration::from_secs(2))
@@ -99,7 +102,45 @@ async fn spawn_http_connect_proxy() -> io::Result<(SocketAddr, JoinHandle<()>)> 
     Ok((addr, handle))
 }
 
-async fn read_header(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+async fn spawn_https_target() -> io::Result<(SocketAddr, JoinHandle<()>)> {
+    let CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let private_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+    let tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert.der().clone()], private_key)
+    .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                if read_header(&mut stream).await.is_ok() {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                }
+            });
+        }
+    });
+    Ok((addr, handle))
+}
+
+async fn read_header<S>(stream: &mut S) -> io::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buffer = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
@@ -278,6 +319,50 @@ async fn health_refresh_filters_failed_proxy_and_swaps_pool() -> io::Result<()> 
     assert_eq!(
         labels_from_pool(&pool),
         vec![format!("http://127.0.0.1:{}", good_proxy_addr.port())]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn https_health_check_can_skip_certificate_verification() -> io::Result<()> {
+    let (target_addr, _target_handle) = spawn_https_target().await?;
+    let (proxy_addr, _proxy_handle) = spawn_http_connect_proxy().await?;
+
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!("http://127.0.0.1:{}\n", proxy_addr.port()),
+    )
+    .unwrap();
+
+    let strict_config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_url: format!("https://localhost:{}/health", target_addr.port()),
+        health_check_attempts: 1,
+        health_check_timeout_ms: 1000,
+        health_check_concurrency: 1,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let pool = ProxyPool::with_runtime_options(Vec::new(), 2, 3, Duration::from_secs(60));
+    let mihomo = MihomoManager::new();
+    let strict_summary = refresh_proxy_pool(&strict_config, &pool, &mihomo, "test")
+        .await
+        .unwrap();
+    assert_eq!(strict_summary.active, 0);
+
+    let skip_config = AppConfig {
+        health_check_tls_skip_verify: true,
+        ..strict_config
+    };
+    let skip_summary = refresh_proxy_pool(&skip_config, &pool, &mihomo, "test")
+        .await
+        .unwrap();
+    assert_eq!(skip_summary.active, 1);
+    assert_eq!(
+        labels_from_pool(&pool),
+        vec![format!("http://127.0.0.1:{}", proxy_addr.port())]
     );
     Ok(())
 }

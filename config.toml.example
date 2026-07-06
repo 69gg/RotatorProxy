@@ -24,9 +24,9 @@ subscription_user_agent = "RotatorProxy/0.1"
 # Default log level. RUST_LOG overrides this value.
 log_level = "info"
 
-# HTTP endpoint used to test outbound proxy liveness.
-# Current health checks support http:// URLs. Pick an endpoint that is stable
-# and reachable from your network; any 2xx/3xx response is considered healthy.
+# HTTP or HTTPS endpoint used to test outbound proxy liveness.
+# Pick an endpoint that is stable and reachable from your network; any 2xx/3xx
+# response is considered healthy.
 health_check_url = "http://example.com/"
 
 # A node must pass within this many attempts to enter the active rotation pool.
@@ -37,6 +37,10 @@ health_check_timeout_ms = 10000
 
 # Maximum number of proxy nodes checked at the same time.
 health_check_concurrency = 32
+
+# When health_check_url uses https://, keep certificate verification enabled by
+# default. Set this to true only for a private/self-signed health endpoint.
+health_check_tls_skip_verify = false
 
 # Runtime connection failures before an active node enters cooldown.
 runtime_failure_threshold = 3
@@ -50,10 +54,10 @@ daily_refresh_time = "04:00"
 
 # Enable the optional Mihomo sidecar fallback for Clash node types that the
 # in-process backend cannot currently dial. Most common TCP nodes are handled
-# without Mihomo: vmess, vless, trojan, hysteria2/hy2, snell, anytls, and
-# Shadowsocks with supported built-in plugins. Keep this off unless you need
-# fallback protocols such as tuic, wireguard/wg, mieru, ssh, ssr, or Reality /
-# client-fingerprint variants.
+# without Mihomo: vmess, vless, trojan, hysteria2/hy2, snell, anytls, Reality
+# TLS, client-fingerprint/uTLS, and Shadowsocks with supported built-in
+# plugins. Keep this off unless you need fallback protocols such as tuic,
+# wireguard/wg, mieru, ssh, or ssr.
 mihomo_enabled = false
 
 # Optional explicit Mihomo binary path. If unset, RotatorProxy checks PATH for
