@@ -192,7 +192,7 @@ pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
                 debug!(
                     node = %proxy.name,
                     kind = %proxy.kind,
-                    "复杂代理暂不支持原生 meow 后端，转入 Mihomo fallback 队列：{err:#}"
+                    "复杂代理暂不支持原生 meow 后端，将在刷新阶段跳过：{err:#}"
                 );
                 fallback.push(proxy);
             }
@@ -202,7 +202,7 @@ pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
     if !fallback.is_empty() {
         warn!(
             fallback_nodes = fallback.len(),
-            "存在需要 Mihomo fallback 的复杂代理；如果 Mihomo 未启用，这些节点会被跳过；打开 debug 日志可查看逐节点原因"
+            "存在原生 meow 后端暂不支持的复杂代理，本轮刷新会跳过这些节点；打开 debug 日志可查看逐节点原因"
         );
     }
 
@@ -233,7 +233,7 @@ fn build_vmess(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Resu
     let uuid = uuid_bytes(&required_string(mapping, &["uuid", "id"], &name)?)?;
     let alter_id = u16_field(mapping, &["alterId", "alter-id", "aid"]).unwrap_or(0);
     if alter_id != 0 {
-        bail!("旧版 VMess alterId={alter_id} 需要 Mihomo fallback");
+        bail!("旧版 VMess alterId={alter_id} 原生暂不支持");
     }
     let security = match string_field(mapping, &["cipher", "security", "scy"])
         .unwrap_or_else(|| "auto".to_owned())
@@ -402,7 +402,7 @@ fn build_shadowsocks(
         && !is_builtin_obfs_plugin(plugin)
         && plugin != "v2ray-plugin"
     {
-        bail!("Shadowsocks plugin {plugin} 需要 Mihomo fallback");
+        bail!("Shadowsocks plugin {plugin} 原生暂不支持");
     }
     let adapter = ShadowsocksAdapter::new(
         &name,

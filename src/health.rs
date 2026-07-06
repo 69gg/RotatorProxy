@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fmt, io,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -25,9 +24,9 @@ use crate::{
     config::{AppConfig, StatusRange, parse_health_check_expected_status},
     load_proxies_from_dirs,
     meow::build_meow_nodes,
-    mihomo::{MihomoManager, MihomoPreparedGeneration, retire_unused_generations},
+    mihomo::MihomoManager,
     outbound::connect_via_proxy_node,
-    proxy::{ProxyNode, ProxyPool, TargetAddr},
+    proxy::{DisabledRecheckFailure, ProxyNode, ProxyPool, TargetAddr},
 };
 
 const HEALTH_RESPONSE_HEADER_LIMIT: usize = 16 * 1024;
@@ -209,7 +208,7 @@ fn build_health_tls_connector(skip_verify: bool) -> io::Result<TlsConnector> {
 pub async fn refresh_proxy_pool(
     config: &AppConfig,
     pool: &ProxyPool,
-    mihomo: &MihomoManager,
+    _mihomo: &MihomoManager,
     reason: &str,
 ) -> Result<RefreshSummary> {
     info!(reason, "开始重新加载代理来源");
@@ -231,92 +230,169 @@ pub async fn refresh_proxy_pool(
     info!(
         reason,
         meow_nodes = meow_active_candidates,
-        fallback_nodes = fallback_candidates,
+        skipped_fallback_nodes = fallback_candidates,
         "复杂代理原生后端准备完成"
     );
-
-    let prepared_mihomo = match mihomo
-        .prepare_generation(config, meow_result.fallback)
-        .await
-    {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            warn!("Mihomo 节点准备失败，相关复杂节点将被跳过：{err:#}");
-            None
-        }
-    };
-    if let Some(prepared) = &prepared_mihomo {
-        candidates.extend_from_slice(prepared.nodes());
-    }
-
-    let active = select_active_proxies(config, candidates).await?;
-    let active_len = active.len();
-    if loaded > 0 && active_len == 0 {
-        if reason != "startup" && !pool.is_empty() {
-            warn!(
-                reason,
-                loaded_nodes = loaded,
-                retained_active_nodes = pool.len(),
-                "本次刷新没有健康节点，保留上一版活动代理池"
-            );
-            return Ok(RefreshSummary {
-                loaded,
-                active: pool.len(),
-            });
-        }
+    if fallback_candidates > 0 {
         warn!(
             reason,
-            loaded_nodes = loaded,
-            "所有已配置代理节点健康检查均失败，活动代理池将为空"
+            skipped_fallback_nodes = fallback_candidates,
+            "Mihomo fallback 已停用，原生后端不支持的复杂节点已跳过"
         );
     }
 
-    apply_mihomo_generation(mihomo, prepared_mihomo, &active, config).await;
-    pool.replace(active);
+    recheck_disabled_proxies(config, pool, reason).await;
+    let active = select_active_proxies(config, candidates).await?;
+    let selected_len = active.len();
+    if loaded > 0 && selected_len == 0 {
+        warn!(
+            reason,
+            loaded_nodes = loaded,
+            retained_active_nodes = pool.len(),
+            "本次刷新没有新的健康节点，现有活动代理池保持不变"
+        );
+    }
+
+    let merge = pool.merge(active);
     info!(
         reason,
         loaded_nodes = loaded,
-        active_nodes = active_len,
-        rejected_nodes = loaded.saturating_sub(active_len),
+        selected_nodes = selected_len,
+        added_nodes = merge.added,
+        active_nodes = merge.active,
+        rejected_nodes = loaded.saturating_sub(selected_len),
         "代理刷新完成"
     );
 
     Ok(RefreshSummary {
         loaded,
-        active: active_len,
+        active: merge.active,
     })
 }
 
-async fn apply_mihomo_generation(
-    mihomo: &MihomoManager,
-    prepared: Option<MihomoPreparedGeneration>,
-    active: &[ProxyNode],
-    config: &AppConfig,
-) {
-    let retire_grace = Duration::from_secs(config.mihomo_retire_grace_seconds);
-    let Some(prepared) = prepared else {
-        if !active
-            .iter()
-            .any(|proxy| proxy.mihomo_generation().is_some())
-        {
-            mihomo.deactivate(retire_grace).await;
-        }
+async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: &str) {
+    let disabled = pool.disabled_proxies();
+    if disabled.is_empty() {
         return;
-    };
-    let active_generation_ids = active
-        .iter()
-        .filter_map(ProxyNode::mihomo_generation)
-        .collect::<HashSet<_>>();
-    let split_generations = prepared.split_active_generations(&active_generation_ids);
-    retire_unused_generations(split_generations.inactive);
-    if !split_generations.active.is_empty() {
-        mihomo
-            .activate(split_generations.active, retire_grace)
-            .await;
-    } else {
-        warn!("所有 Mihomo 承载节点健康检查均失败，本次 Mihomo 批次不会激活");
-        mihomo.deactivate(retire_grace).await;
     }
+
+    let target = match HealthCheckTarget::from_config(config) {
+        Ok(target) => Arc::new(target),
+        Err(err) => {
+            warn!(
+                reason,
+                disabled_nodes = disabled.len(),
+                "失效代理静默测活配置无效，本轮跳过恢复检查：{err:#}"
+            );
+            return;
+        }
+    };
+    let attempts = config.health_check_attempts.max(1);
+    let timeout_ms = config.health_check_timeout_ms.max(1);
+    let timeout = Duration::from_millis(timeout_ms);
+    let worker_count = config.health_check_concurrency.max(1).min(disabled.len());
+    info!(
+        reason,
+        disabled_nodes = disabled.len(),
+        target = %target.display,
+        expected_status = %target.expected_display,
+        attempts,
+        timeout_ms,
+        concurrency = worker_count,
+        "失效代理静默健康检查开始"
+    );
+
+    let queue = Arc::new(Mutex::new(disabled.into_iter()));
+    let mut checks = JoinSet::new();
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let target = Arc::clone(&target);
+        checks.spawn(async move {
+            let mut results = Vec::new();
+            loop {
+                let disabled = {
+                    queue
+                        .lock()
+                        .expect("disabled health check queue lock poisoned")
+                        .next()
+                };
+                let Some(disabled) = disabled else {
+                    break;
+                };
+                let healthy = check_proxy_node(&disabled.node, &target, attempts, timeout)
+                    .await
+                    .is_some();
+                results.push((disabled, healthy));
+            }
+            results
+        });
+    }
+
+    let mut checked = 0;
+    let mut recovered = 0;
+    let mut still_disabled = 0;
+    let mut removed = 0;
+    while let Some(result) = checks.join_next().await {
+        let Ok(results) = result else {
+            warn!("失效代理静默健康检查任务失败");
+            continue;
+        };
+        for (disabled, healthy) in results {
+            checked += 1;
+            if healthy {
+                if pool.report_disabled_recheck_success(&disabled.key) {
+                    recovered += 1;
+                    info!(
+                        node = %disabled.label,
+                        kind = disabled.node.kind(),
+                        upstream = %disabled.node.upstream_addr(),
+                        "失效代理静默测活成功，已恢复到轮询池"
+                    );
+                }
+                continue;
+            }
+
+            match pool.report_disabled_recheck_failure(&disabled.key) {
+                DisabledRecheckFailure::StillDisabled {
+                    failures,
+                    threshold,
+                } => {
+                    still_disabled += 1;
+                    debug!(
+                        node = %disabled.label,
+                        kind = disabled.node.kind(),
+                        upstream = %disabled.node.upstream_addr(),
+                        failures,
+                        threshold,
+                        "失效代理静默测活失败，继续保留在失效名单"
+                    );
+                }
+                DisabledRecheckFailure::Removed {
+                    failures,
+                    threshold,
+                } => {
+                    removed += 1;
+                    warn!(
+                        node = %disabled.label,
+                        kind = disabled.node.kind(),
+                        upstream = %disabled.node.upstream_addr(),
+                        failures,
+                        threshold,
+                        "失效代理连续静默测活失败，已从代理池删除"
+                    );
+                }
+                DisabledRecheckFailure::NotDisabled => {}
+            }
+        }
+    }
+    info!(
+        reason,
+        checked_nodes = checked,
+        recovered_nodes = recovered,
+        still_disabled_nodes = still_disabled,
+        removed_nodes = removed,
+        "失效代理静默健康检查完成"
+    );
 }
 
 pub fn spawn_refresh_scheduler(

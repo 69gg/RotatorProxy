@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 const FAILURE_SHARDS: usize = 64;
 const DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS: usize = 2;
+const DEFAULT_DISABLED_RECHECK_DELETE_AFTER_FAILURES: usize = 3;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HostPort {
@@ -339,6 +340,29 @@ impl ProxyEntry {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PoolMergeSummary {
+    pub previous: usize,
+    pub added: usize,
+    pub skipped_existing: usize,
+    pub skipped_retired: usize,
+    pub active: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct DisabledProxy {
+    pub key: String,
+    pub label: String,
+    pub node: ProxyNode,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum DisabledRecheckFailure {
+    StillDisabled { failures: usize, threshold: usize },
+    Removed { failures: usize, threshold: usize },
+    NotDisabled,
+}
+
 #[derive(Debug)]
 pub struct ProxyPool {
     inner: Arc<ProxyPoolInner>,
@@ -360,12 +384,14 @@ struct FailureRecord {
     failures: usize,
     cooldowns: usize,
     cooldown_until: Option<Instant>,
-    disabled_until_refresh: bool,
+    disabled: bool,
+    disabled_recheck_failures: usize,
 }
 
 #[derive(Debug)]
 struct PoolState {
     proxies: Arc<Vec<Arc<ProxyEntry>>>,
+    retired_keys: HashSet<String>,
     generation: u64,
 }
 
@@ -427,6 +453,7 @@ impl ProxyPool {
             inner: Arc::new(ProxyPoolInner {
                 state: RwLock::new(PoolState {
                     proxies: Arc::new(entries_from_nodes(proxies)),
+                    retired_keys: HashSet::new(),
                     generation: 0,
                 }),
                 selection: Mutex::new(SelectionBag::default()),
@@ -455,6 +482,7 @@ impl ProxyPool {
         let generation = {
             let mut guard = self.inner.state.write().expect("proxy pool lock poisoned");
             guard.proxies = Arc::new(entries);
+            guard.retired_keys.clear();
             guard.generation = guard.generation.wrapping_add(1);
             guard.generation
         };
@@ -468,6 +496,64 @@ impl ProxyPool {
         }
         self.clear_failure_records();
         info!("活动代理池已切换，active_nodes={new_len}");
+    }
+
+    pub fn merge(&self, proxies: Vec<ProxyNode>) -> PoolMergeSummary {
+        let mut entries = entries_from_nodes(proxies);
+        let mut generation_to_reset = None;
+        let summary = {
+            let mut guard = self.inner.state.write().expect("proxy pool lock poisoned");
+            let previous = guard.proxies.len();
+            let mut known = guard
+                .proxies
+                .iter()
+                .map(|entry| entry.key.clone())
+                .collect::<HashSet<_>>();
+            let mut skipped_existing = 0;
+            let mut skipped_retired = 0;
+            let mut merged = Vec::with_capacity(previous + entries.len());
+            merged.extend(guard.proxies.iter().cloned());
+
+            for entry in entries.drain(..) {
+                if guard.retired_keys.contains(&entry.key) {
+                    skipped_retired += 1;
+                    continue;
+                }
+                if !known.insert(entry.key.clone()) {
+                    skipped_existing += 1;
+                    continue;
+                }
+                merged.push(entry);
+            }
+
+            let added = merged.len().saturating_sub(previous);
+            if added > 0 {
+                guard.proxies = Arc::new(merged);
+                guard.generation = guard.generation.wrapping_add(1);
+                generation_to_reset = Some(guard.generation);
+            }
+
+            PoolMergeSummary {
+                previous,
+                added,
+                skipped_existing,
+                skipped_retired,
+                active: guard.proxies.len(),
+            }
+        };
+
+        if let Some(generation) = generation_to_reset {
+            self.reset_selection(generation);
+        }
+        info!(
+            previous_nodes = summary.previous,
+            added_nodes = summary.added,
+            active_nodes = summary.active,
+            skipped_existing = summary.skipped_existing,
+            skipped_retired = summary.skipped_retired,
+            "活动代理池已增量更新"
+        );
+        summary
     }
 
     pub fn attempts(&self) -> ProxyAttempts {
@@ -505,6 +591,22 @@ impl ProxyPool {
         self.attempts().collect()
     }
 
+    pub fn disabled_proxies(&self) -> Vec<DisabledProxy> {
+        let snapshot = self.snapshot();
+        snapshot
+            .iter()
+            .filter_map(|entry| {
+                let mut failures = self.failure_shard(&entry.key);
+                let record = failures.get_mut(&entry.key)?;
+                record.disabled.then(|| DisabledProxy {
+                    key: entry.key.clone(),
+                    label: entry.label.clone(),
+                    node: (*entry.node).clone(),
+                })
+            })
+            .collect()
+    }
+
     pub fn report_success(&self, choice: &ProxyChoice) {
         let ProxyChoice::Proxy(entry) = choice else {
             return;
@@ -513,12 +615,16 @@ impl ProxyPool {
         let Some(record) = failures.get_mut(&entry.key) else {
             return;
         };
-        let had_pending_state = record.failures > 0 || record.cooldown_until.is_some();
+        let had_pending_state = record.failures > 0
+            || record.cooldown_until.is_some()
+            || record.disabled
+            || record.disabled_recheck_failures > 0;
         record.failures = 0;
+        record.cooldowns = 0;
         record.cooldown_until = None;
-        if !record.disabled_until_refresh && record.cooldowns == 0 {
-            failures.remove(&entry.key);
-        }
+        record.disabled = false;
+        record.disabled_recheck_failures = 0;
+        failures.remove(&entry.key);
         if had_pending_state {
             debug!(
                 node = %entry.label,
@@ -539,9 +645,10 @@ impl ProxyPool {
             failures: 0,
             cooldowns: 0,
             cooldown_until: None,
-            disabled_until_refresh: false,
+            disabled: false,
+            disabled_recheck_failures: 0,
         });
-        if record.disabled_until_refresh {
+        if record.disabled {
             return;
         }
         if record.cooldown_until.is_some_and(|until| until <= now) {
@@ -555,14 +662,15 @@ impl ProxyPool {
             record.cooldowns += 1;
             if record.cooldowns >= self.inner.runtime_disable_after_cooldowns {
                 record.cooldown_until = None;
-                record.disabled_until_refresh = true;
+                record.disabled = true;
+                record.disabled_recheck_failures = 0;
                 warn!(
                     node = %entry.label,
                     kind = entry.node.kind(),
                     upstream = %entry.node.upstream_addr(),
                     cooldowns = record.cooldowns,
                     threshold = self.inner.runtime_disable_after_cooldowns,
-                    "代理在当前刷新周期内多次失败，已禁用到下次刷新"
+                    "代理在当前运行周期内多次失败，已加入失效名单"
                 );
             } else {
                 record.cooldown_until = Some(now + self.inner.cooldown);
@@ -586,6 +694,60 @@ impl ProxyPool {
                 "已记录代理运行时失败"
             );
         }
+    }
+
+    pub fn report_disabled_recheck_success(&self, key: &str) -> bool {
+        {
+            let mut failures = self.failure_shard(key);
+            let Some(record) = failures.get_mut(key) else {
+                return false;
+            };
+            if !record.disabled {
+                return false;
+            }
+            record.failures = 0;
+            record.cooldowns = 0;
+            record.cooldown_until = None;
+            record.disabled = false;
+            record.disabled_recheck_failures = 0;
+            failures.remove(key);
+        }
+        self.reset_selection_to_current_generation();
+        true
+    }
+
+    pub fn report_disabled_recheck_failure(&self, key: &str) -> DisabledRecheckFailure {
+        let mut should_remove = false;
+        let result = {
+            let mut failures = self.failure_shard(key);
+            let Some(record) = failures.get_mut(key) else {
+                return DisabledRecheckFailure::NotDisabled;
+            };
+            if !record.disabled {
+                return DisabledRecheckFailure::NotDisabled;
+            }
+            record.disabled_recheck_failures += 1;
+            let failures_count = record.disabled_recheck_failures;
+            let threshold = DEFAULT_DISABLED_RECHECK_DELETE_AFTER_FAILURES;
+            if failures_count >= threshold {
+                failures.remove(key);
+                should_remove = true;
+                DisabledRecheckFailure::Removed {
+                    failures: failures_count,
+                    threshold,
+                }
+            } else {
+                DisabledRecheckFailure::StillDisabled {
+                    failures: failures_count,
+                    threshold,
+                }
+            }
+        };
+
+        if should_remove {
+            self.remove_and_retire(key);
+        }
+        result
     }
 
     fn snapshot(&self) -> Arc<Vec<Arc<ProxyEntry>>> {
@@ -647,12 +809,12 @@ impl ProxyPool {
         let Some(record) = failures.get_mut(&entry.key) else {
             return false;
         };
-        if record.disabled_until_refresh {
+        if record.disabled {
             debug!(
                 node = %entry.label,
                 kind = entry.node.kind(),
                 upstream = %entry.node.upstream_addr(),
-                "代理已禁用到下次刷新，已跳过"
+                "代理已加入失效名单，已跳过"
             );
             return true;
         }
@@ -684,6 +846,45 @@ impl ProxyPool {
             let mut failures = shard.lock().expect("proxy failure lock poisoned");
             failures.clear();
         }
+    }
+
+    fn reset_selection(&self, generation: u64) {
+        let mut selection = self
+            .inner
+            .selection
+            .lock()
+            .expect("proxy selection lock poisoned");
+        selection.reset(generation);
+    }
+
+    fn reset_selection_to_current_generation(&self) {
+        let generation = self
+            .inner
+            .state
+            .read()
+            .expect("proxy pool lock poisoned")
+            .generation;
+        self.reset_selection(generation);
+    }
+
+    fn remove_and_retire(&self, key: &str) {
+        let generation = {
+            let mut guard = self.inner.state.write().expect("proxy pool lock poisoned");
+            guard.retired_keys.insert(key.to_owned());
+            let retained = guard
+                .proxies
+                .iter()
+                .filter(|entry| entry.key != key)
+                .cloned()
+                .collect::<Vec<_>>();
+            if retained.len() == guard.proxies.len() {
+                return;
+            }
+            guard.proxies = Arc::new(retained);
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.generation
+        };
+        self.reset_selection(generation);
     }
 }
 
@@ -857,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_disables_after_repeated_cooldowns_until_replace() {
+    fn proxy_disables_after_repeated_cooldowns_until_recheck_success() {
         let pool = ProxyPool::with_runtime_failure_policy(
             vec![http_proxy(1)],
             1,
@@ -877,9 +1078,105 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(40));
         assert!(pool.candidates().is_empty());
+        assert_eq!(pool.disabled_proxies().len(), 1);
 
-        pool.replace(vec![http_proxy(1)]);
+        assert!(pool.report_disabled_recheck_success("http://127.0.0.1:1"));
         assert_eq!(pool.candidates().len(), 1);
+    }
+
+    #[test]
+    fn merge_appends_new_nodes_and_skips_duplicates() {
+        let pool = ProxyPool::new(vec![http_proxy(1)], 0);
+
+        let summary = pool.merge(vec![http_proxy(1), http_proxy(2), http_proxy(3)]);
+
+        assert_eq!(
+            summary,
+            PoolMergeSummary {
+                previous: 1,
+                added: 2,
+                skipped_existing: 1,
+                skipped_retired: 0,
+                active: 3,
+            }
+        );
+        let labels = pool
+            .candidates()
+            .into_iter()
+            .map(|choice| choice.label())
+            .collect::<HashSet<_>>();
+        assert_eq!(labels.len(), 3);
+        assert!(labels.contains("http://127.0.0.1:1"));
+        assert!(labels.contains("http://127.0.0.1:2"));
+        assert!(labels.contains("http://127.0.0.1:3"));
+    }
+
+    #[test]
+    fn disabled_proxy_is_not_restored_by_merge() {
+        let pool = ProxyPool::with_runtime_failure_policy(
+            vec![http_proxy(1)],
+            0,
+            1,
+            Duration::from_millis(30),
+            1,
+        );
+        let choice = pool.candidates().pop().unwrap();
+        pool.report_failure(&choice);
+        assert!(pool.candidates().is_empty());
+
+        let summary = pool.merge(vec![http_proxy(1), http_proxy(2)]);
+
+        assert_eq!(summary.added, 1);
+        let labels = pool
+            .candidates()
+            .into_iter()
+            .map(|choice| choice.label())
+            .collect::<HashSet<_>>();
+        assert_eq!(labels, HashSet::from(["http://127.0.0.1:2".to_owned()]));
+        assert_eq!(pool.disabled_proxies().len(), 1);
+    }
+
+    #[test]
+    fn disabled_proxy_is_removed_after_three_recheck_failures_and_retired() {
+        let pool = ProxyPool::with_runtime_failure_policy(
+            vec![http_proxy(1), http_proxy(2)],
+            0,
+            1,
+            Duration::from_millis(30),
+            1,
+        );
+        let choice = pool
+            .candidates()
+            .into_iter()
+            .find(|choice| choice.label() == "http://127.0.0.1:1")
+            .unwrap();
+        pool.report_failure(&choice);
+
+        assert!(matches!(
+            pool.report_disabled_recheck_failure("http://127.0.0.1:1"),
+            DisabledRecheckFailure::StillDisabled { failures: 1, .. }
+        ));
+        assert!(matches!(
+            pool.report_disabled_recheck_failure("http://127.0.0.1:1"),
+            DisabledRecheckFailure::StillDisabled { failures: 2, .. }
+        ));
+        assert!(matches!(
+            pool.report_disabled_recheck_failure("http://127.0.0.1:1"),
+            DisabledRecheckFailure::Removed { failures: 3, .. }
+        ));
+
+        let summary = pool.merge(vec![http_proxy(1), http_proxy(3)]);
+
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.skipped_retired, 1);
+        let labels = pool
+            .candidates()
+            .into_iter()
+            .map(|choice| choice.label())
+            .collect::<HashSet<_>>();
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains("http://127.0.0.1:2"));
+        assert!(labels.contains("http://127.0.0.1:3"));
     }
 
     #[test]

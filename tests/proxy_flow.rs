@@ -552,6 +552,176 @@ async fn scheduled_refresh_keeps_previous_pool_when_all_new_nodes_fail() -> io::
 }
 
 #[tokio::test]
+async fn scheduled_refresh_appends_new_nodes_without_removing_old_nodes() -> io::Result<()> {
+    let (old_proxy_addr, _old_proxy_handle) = spawn_http_connect_proxy().await?;
+    let (new_proxy_addr, _new_proxy_handle) = spawn_http_connect_proxy().await?;
+
+    let previous = ProxyNode::Http {
+        addr: HostPort::new("127.0.0.1", old_proxy_addr.port()).unwrap(),
+        auth: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!(
+            "http://127.0.0.1:{}\nhttp://127.0.0.1:{}\n",
+            old_proxy_addr.port(),
+            new_proxy_addr.port()
+        ),
+    )
+    .unwrap();
+
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_enabled: false,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let pool = ProxyPool::with_runtime_options(vec![previous], 0, 3, Duration::from_secs(60));
+    let mihomo = MihomoManager::new();
+
+    let summary = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.loaded, 2);
+    assert_eq!(summary.active, 2);
+    let labels: HashSet<String> = labels_from_pool(&pool).into_iter().collect();
+    assert_eq!(labels.len(), 2);
+    assert!(labels.contains(&format!("http://127.0.0.1:{}", old_proxy_addr.port())));
+    assert!(labels.contains(&format!("http://127.0.0.1:{}", new_proxy_addr.port())));
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_node_rechecks_even_when_health_precheck_is_disabled() -> io::Result<()> {
+    let (target_addr, _first_line_rx, _target_handle) = spawn_http_target().await?;
+    let (proxy_addr, _proxy_handle) = spawn_http_connect_proxy().await?;
+    let previous = ProxyNode::Http {
+        addr: HostPort::new("127.0.0.1", proxy_addr.port()).unwrap(),
+        auth: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!("http://127.0.0.1:{}\n", proxy_addr.port()),
+    )
+    .unwrap();
+
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_enabled: false,
+        health_check_url: format!("http://{target_addr}/health"),
+        health_check_attempts: 1,
+        health_check_timeout_ms: 1000,
+        health_check_concurrency: 1,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let pool =
+        ProxyPool::with_runtime_failure_policy(vec![previous], 0, 1, Duration::from_millis(30), 1);
+    let choice = pool.candidates().pop().unwrap();
+    pool.report_failure(&choice);
+    assert!(pool.candidates().is_empty());
+
+    let mihomo = MihomoManager::new();
+    let summary = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.loaded, 1);
+    assert_eq!(summary.active, 1);
+    assert_eq!(
+        labels_from_pool(&pool),
+        vec![format!("http://127.0.0.1:{}", proxy_addr.port())]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_node_is_removed_after_three_silent_recheck_failures() -> io::Result<()> {
+    let bad_port = unused_local_port().await?;
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(&proxy_file, format!("http://127.0.0.1:{bad_port}\n")).unwrap();
+
+    let previous = ProxyNode::Http {
+        addr: HostPort::new("127.0.0.1", bad_port).unwrap(),
+        auth: None,
+    };
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_enabled: false,
+        health_check_url: "http://127.0.0.1:9/health".to_owned(),
+        health_check_attempts: 1,
+        health_check_timeout_ms: 100,
+        health_check_concurrency: 1,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let pool =
+        ProxyPool::with_runtime_failure_policy(vec![previous], 0, 1, Duration::from_millis(30), 1);
+    let choice = pool.candidates().pop().unwrap();
+    pool.report_failure(&choice);
+    let mihomo = MihomoManager::new();
+
+    for _ in 0..3 {
+        let summary = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled")
+            .await
+            .unwrap();
+        assert_eq!(summary.loaded, 1);
+    }
+
+    assert_eq!(labels_from_pool(&pool), vec!["direct"]);
+    let summary = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled")
+        .await
+        .unwrap();
+    assert_eq!(summary.active, 0);
+    assert_eq!(labels_from_pool(&pool), vec!["direct"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mihomo_fallback_nodes_are_skipped_even_when_mihomo_is_enabled() -> io::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("clash.yaml");
+    fs::write(
+        &proxy_file,
+        r#"
+proxies:
+  - name: tuic-a
+    type: tuic
+    server: example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+    password: secret
+"#,
+    )
+    .unwrap();
+
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_enabled: false,
+        mihomo_enabled: true,
+        mihomo_binary: Some(dir.path().join("missing-mihomo")),
+        ..AppConfig::default()
+    };
+    let pool = ProxyPool::with_runtime_options(Vec::new(), 0, 3, Duration::from_secs(60));
+    let mihomo = MihomoManager::new();
+
+    let summary = refresh_proxy_pool(&config, &pool, &mihomo, "test")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.loaded, 1);
+    assert_eq!(summary.active, 0);
+    assert_eq!(labels_from_pool(&pool), vec!["direct"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_refresh_accepts_https_proxy() -> io::Result<()> {
     let (target_addr, _first_line_rx, _target_handle) = spawn_http_target().await?;
     let (proxy_addr, _proxy_handle) = spawn_https_connect_proxy().await?;

@@ -77,40 +77,35 @@ daily_refresh_time = "04:00"
 # takes precedence over daily_refresh_time.
 # refresh_interval_seconds = 3600
 
-# Enable the optional Mihomo sidecar fallback for Clash node types that the
-# in-process backend cannot currently dial. Most common TCP nodes are handled
-# without Mihomo: vmess, vless, trojan, hysteria2/hy2, snell, anytls, Reality
-# TLS, client-fingerprint/uTLS, and Shadowsocks with supported built-in
-# plugins. Keep this off unless you need fallback protocols such as tuic,
-# wireguard/wg, mieru, ssh, or ssr.
+# Historical compatibility option. Mihomo fallback is currently disabled in
+# the refresh path; complex nodes that the in-process backend cannot dial are
+# skipped instead of being handed to a Mihomo sidecar.
 mihomo_enabled = false
 
-# Optional explicit Mihomo binary path. If unset, RotatorProxy checks PATH for
-# mihomo, clash-meta, then clash.
+# Historical Mihomo fallback setting; currently unused while fallback is
+# disabled.
 # mihomo_binary = "/usr/local/bin/mihomo"
 
-# If Mihomo fallback is enabled and no binary is configured or found in PATH,
-# automatically download the latest Mihomo release on Linux amd64/arm64. Other
-# platforms should provide a binary through mihomo_binary or PATH.
+# Historical Mihomo fallback setting; currently unused while fallback is
+# disabled.
 mihomo_auto_download = false
 
-# Work directory for downloaded Mihomo binaries and generated batch configs.
-# This path is runtime state and is ignored by Git in the default repository.
+# Historical Mihomo fallback setting; currently unused while fallback is
+# disabled.
 mihomo_work_dir = ".rotator-proxy/mihomo"
 
-# Log level written into generated Mihomo configs.
+# Historical Mihomo fallback setting; currently unused while fallback is
+# disabled.
 mihomo_log_level = "warning"
 
-# Maximum fallback nodes placed into one Mihomo process. RotatorProxy will
-# shrink the current batch and retry if reserving local ports hits
-# "Too many open files"; lower this if your system has a small per-process file
-# descriptor limit.
+# Historical Mihomo fallback setting; currently unused while fallback is
+# disabled.
 mihomo_generation_batch_size = 256
 
-# Maximum time to wait for a newly spawned Mihomo batch to open all local
-# listeners before its nodes are skipped for that refresh.
+# Historical Mihomo fallback setting; currently unused while fallback is
+# disabled.
 mihomo_startup_timeout_ms = 10000
 
-# After a successful refresh swaps in a new pool, keep the previous Mihomo
-# batch alive for this long so existing connections can drain.
+# Historical Mihomo fallback setting; currently unused while fallback is
+# disabled.
 mihomo_retire_grace_seconds = 300
