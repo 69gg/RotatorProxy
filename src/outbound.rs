@@ -2,7 +2,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr},
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -59,18 +59,52 @@ impl Connector {
     pub async fn connect(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
         let mut attempts = self.pool.attempts();
         let mut last_error = None;
+        let mut attempt_no = 0_usize;
 
         for choice in &mut attempts {
+            attempt_no += 1;
             let label = choice.label();
+            let kind = choice.kind();
+            let upstream = choice.upstream_addr(target);
+            let started_at = Instant::now();
+            debug!(
+                attempt = attempt_no,
+                node = %label,
+                kind,
+                upstream = %upstream,
+                target = %target,
+                timeout_ms = self.connect_timeout.as_millis(),
+                "开始出站连接尝试"
+            );
             let attempt = timeout(self.connect_timeout, self.connect_once(&choice, target)).await;
             match attempt {
                 Ok(Ok(stream)) => {
+                    let elapsed_ms = started_at.elapsed().as_millis();
                     self.pool.report_success(&choice);
-                    debug!("已通过 {label} 连接到 {target}");
+                    debug!(
+                        attempt = attempt_no,
+                        node = %label,
+                        kind,
+                        upstream = %upstream,
+                        target = %target,
+                        elapsed_ms,
+                        "出站连接尝试成功"
+                    );
                     return Ok(stream);
                 }
                 Ok(Err(err)) => {
-                    warn!("通过 {label} 连接到 {target} 失败：{err}");
+                    let elapsed_ms = started_at.elapsed().as_millis();
+                    warn!(
+                        attempt = attempt_no,
+                        node = %label,
+                        kind,
+                        upstream = %upstream,
+                        target = %target,
+                        elapsed_ms,
+                        error_kind = ?err.kind(),
+                        error = %err,
+                        "出站连接尝试失败"
+                    );
                     self.pool.report_failure(&choice);
                     last_error = Some(err);
                 }
@@ -79,14 +113,32 @@ impl Connector {
                         io::ErrorKind::TimedOut,
                         format!("连接超时，耗时 {:?}", self.connect_timeout),
                     );
-                    warn!("通过 {label} 连接到 {target} 失败：{err}");
+                    warn!(
+                        attempt = attempt_no,
+                        node = %label,
+                        kind,
+                        upstream = %upstream,
+                        target = %target,
+                        timeout_ms = self.connect_timeout.as_millis(),
+                        error_kind = ?err.kind(),
+                        error = %err,
+                        "出站连接尝试超时"
+                    );
                     self.pool.report_failure(&choice);
                     last_error = Some(err);
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| io::Error::other("没有可用出站路由")))
+        let err = last_error.unwrap_or_else(|| io::Error::other("没有可用出站路由"));
+        warn!(
+            target = %target,
+            attempts = attempt_no,
+            error_kind = ?err.kind(),
+            error = %err,
+            "本次出站连接已耗尽可用候选"
+        );
+        Err(err)
     }
 
     async fn connect_once(
@@ -188,11 +240,13 @@ fn metadata_from_target(target: &TargetAddr) -> Metadata {
 }
 
 async fn connect_direct(target: &TargetAddr) -> io::Result<BoxedStream> {
+    debug!(target = %target, "正在直连目标地址");
     let stream = TcpStream::connect((target.host.as_str(), target.port)).await?;
     Ok(Box::new(stream))
 }
 
 async fn connect_proxy_tcp(addr: &HostPort) -> io::Result<TcpStream> {
+    debug!(upstream = %addr, "正在直连出站代理第一跳");
     TcpStream::connect((addr.host.as_str(), addr.port)).await
 }
 
@@ -233,6 +287,7 @@ async fn connect_http_tunnel<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    debug!(target = %target, auth = auth.is_some(), "正在发送 HTTP CONNECT 握手");
     let mut request =
         format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: Keep-Alive\r\n");
     if let Some(auth) = auth {
@@ -245,6 +300,7 @@ where
     stream.write_all(request.as_bytes()).await?;
     let response = read_http_header(&mut stream, HTTP_CONNECT_RESPONSE_LIMIT).await?;
     validate_http_connect_response(&response)?;
+    debug!(target = %target, "HTTP CONNECT 握手成功");
     Ok(Box::new(stream))
 }
 
@@ -379,6 +435,13 @@ async fn connect_socks5_proxy(
     target: &TargetAddr,
 ) -> io::Result<BoxedStream> {
     let mut stream = connect_proxy_tcp(addr).await?;
+    debug!(
+        upstream = %addr,
+        target = %target,
+        remote_dns,
+        auth = auth.is_some(),
+        "正在执行 SOCKS5 握手"
+    );
     socks5_authenticate(&mut stream, auth).await?;
     let target_addr = if remote_dns {
         encode_socks5_domain_or_ip(target)?
@@ -391,6 +454,7 @@ async fn connect_socks5_proxy(
     request.extend_from_slice(&target_addr);
     stream.write_all(&request).await?;
     read_socks5_connect_response(&mut stream).await?;
+    debug!(upstream = %addr, target = %target, "SOCKS5 CONNECT 成功");
     Ok(Box::new(stream))
 }
 
@@ -547,6 +611,13 @@ async fn connect_socks4_proxy(
     target: &TargetAddr,
 ) -> io::Result<BoxedStream> {
     let mut stream = connect_proxy_tcp(addr).await?;
+    debug!(
+        upstream = %addr,
+        target = %target,
+        remote_dns,
+        auth = auth.is_some(),
+        "正在执行 SOCKS4 握手"
+    );
     let ip = if remote_dns {
         Ipv4Addr::new(0, 0, 0, 1)
     } else {
@@ -576,6 +647,7 @@ async fn connect_socks4_proxy(
             response[1]
         )));
     }
+    debug!(upstream = %addr, target = %target, "SOCKS4 CONNECT 成功");
     Ok(Box::new(stream))
 }
 

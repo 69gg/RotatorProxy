@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
-use meow_common::ProxyAdapter;
+use meow_common::{AdapterType, ProxyAdapter};
 use rand::seq::SliceRandom;
 use shadowsocks::{ServerConfig, relay::socks5::Address as ShadowAddress};
 use tracing::{debug, info, warn};
@@ -100,6 +100,30 @@ pub enum ProxyNode {
 }
 
 impl ProxyNode {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Http { .. } => "http",
+            Self::Https { .. } => "https",
+            Self::Socks5 { .. } => "socks5",
+            Self::Socks4 { .. } => "socks4",
+            Self::Shadowsocks { .. } => "shadowsocks",
+            Self::LocalMihomo { .. } => "mihomo",
+            Self::Meow(node) => meow_adapter_kind(node.adapter.adapter_type()),
+        }
+    }
+
+    pub fn upstream_addr(&self) -> String {
+        match self {
+            Self::Http { addr, .. }
+            | Self::Https { addr, .. }
+            | Self::Socks5 { addr, .. }
+            | Self::Socks4 { addr, .. }
+            | Self::LocalMihomo { addr, .. } => addr.to_string(),
+            Self::Shadowsocks { server, .. } => server.addr().to_string(),
+            Self::Meow(node) => node.adapter.addr().to_owned(),
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::Http { addr, .. } => format!("http://{addr}"),
@@ -182,6 +206,28 @@ fn auth_key(auth: Option<&Credentials>) -> String {
     .unwrap_or_default()
 }
 
+fn meow_adapter_kind(kind: AdapterType) -> &'static str {
+    match kind {
+        AdapterType::Direct => "direct",
+        AdapterType::Reject => "reject",
+        AdapterType::RejectDrop => "reject-drop",
+        AdapterType::Selector => "selector",
+        AdapterType::Fallback => "fallback",
+        AdapterType::UrlTest => "url-test",
+        AdapterType::LoadBalance => "load-balance",
+        AdapterType::Relay => "relay",
+        AdapterType::Shadowsocks => "shadowsocks",
+        AdapterType::Socks5 => "socks5",
+        AdapterType::Http => "http",
+        AdapterType::Vmess => "vmess",
+        AdapterType::Vless => "vless",
+        AdapterType::Trojan => "trojan",
+        AdapterType::Hysteria2 => "hysteria2",
+        AdapterType::Anytls => "anytls",
+        AdapterType::Snell => "snell",
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TargetAddr {
     pub host: String,
@@ -256,6 +302,20 @@ impl ProxyChoice {
         match self {
             Self::Direct => "direct".to_owned(),
             Self::Proxy(entry) => entry.label.clone(),
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Proxy(entry) => entry.node.kind(),
+        }
+    }
+
+    pub fn upstream_addr(&self, target: &TargetAddr) -> String {
+        match self {
+            Self::Direct => target.to_string(),
+            Self::Proxy(entry) => entry.node.upstream_addr(),
         }
     }
 }
@@ -413,6 +473,7 @@ impl ProxyPool {
     pub fn attempts(&self) -> ProxyAttempts {
         let len = self.len();
         if len == 0 {
+            debug!("活动代理池为空，本次请求将使用直连");
             return ProxyAttempts {
                 pool: self.clone(),
                 tried: HashSet::new(),
@@ -426,6 +487,12 @@ impl ProxyPool {
         } else {
             self.inner.max_retries.min(len)
         };
+        debug!(
+            active_nodes = len,
+            attempt_limit = remaining,
+            max_retries = self.inner.max_retries,
+            "已创建本次出站候选迭代器"
+        );
         ProxyAttempts {
             pool: self.clone(),
             tried: HashSet::with_capacity(remaining),
@@ -453,7 +520,12 @@ impl ProxyPool {
             failures.remove(&entry.key);
         }
         if had_pending_state {
-            debug!(node = %entry.label, "代理运行时失败计数已在成功后重置");
+            debug!(
+                node = %entry.label,
+                kind = entry.node.kind(),
+                upstream = %entry.node.upstream_addr(),
+                "代理运行时失败计数已在成功后重置"
+            );
         }
     }
 
@@ -486,6 +558,8 @@ impl ProxyPool {
                 record.disabled_until_refresh = true;
                 warn!(
                     node = %entry.label,
+                    kind = entry.node.kind(),
+                    upstream = %entry.node.upstream_addr(),
                     cooldowns = record.cooldowns,
                     threshold = self.inner.runtime_disable_after_cooldowns,
                     "代理在当前刷新周期内多次失败，已禁用到下次刷新"
@@ -494,6 +568,8 @@ impl ProxyPool {
                 record.cooldown_until = Some(now + self.inner.cooldown);
                 warn!(
                     node = %entry.label,
+                    kind = entry.node.kind(),
+                    upstream = %entry.node.upstream_addr(),
                     cooldown_seconds = self.inner.cooldown.as_secs(),
                     cooldowns = record.cooldowns,
                     disable_threshold = self.inner.runtime_disable_after_cooldowns,
@@ -503,6 +579,8 @@ impl ProxyPool {
         } else {
             warn!(
                 node = %entry.label,
+                kind = entry.node.kind(),
+                upstream = %entry.node.upstream_addr(),
                 failures = record.failures,
                 threshold = self.inner.runtime_failure_threshold,
                 "已记录代理运行时失败"
@@ -537,6 +615,11 @@ impl ProxyPool {
             let (index, refilled) = selection.next_index(state.generation, len)?;
             if refilled {
                 scanned_in_round = 0;
+                debug!(
+                    generation = state.generation,
+                    candidates = len,
+                    "代理随机轮换袋已重新洗牌"
+                );
             }
             scanned_in_round += 1;
             let entry = Arc::clone(&state.proxies[index]);
@@ -565,19 +648,34 @@ impl ProxyPool {
             return false;
         };
         if record.disabled_until_refresh {
-            debug!(node = %entry.label, "代理已禁用到下次刷新，已跳过");
+            debug!(
+                node = %entry.label,
+                kind = entry.node.kind(),
+                upstream = %entry.node.upstream_addr(),
+                "代理已禁用到下次刷新，已跳过"
+            );
             return true;
         }
         let Some(until) = record.cooldown_until else {
             return false;
         };
         if until > now {
-            debug!(node = %entry.label, "代理仍在冷却期，已跳过");
+            debug!(
+                node = %entry.label,
+                kind = entry.node.kind(),
+                upstream = %entry.node.upstream_addr(),
+                "代理仍在冷却期，已跳过"
+            );
             return true;
         }
         record.failures = 0;
         record.cooldown_until = None;
-        debug!(node = %entry.label, "代理冷却期已结束");
+        debug!(
+            node = %entry.label,
+            kind = entry.node.kind(),
+            upstream = %entry.node.upstream_addr(),
+            "代理冷却期已结束"
+        );
         false
     }
 
@@ -647,6 +745,27 @@ mod tests {
             addr: HostPort::new("127.0.0.1", port).unwrap(),
             auth: None,
         }
+    }
+
+    #[test]
+    fn proxy_node_reports_safe_upstream_and_kind() {
+        let node = ProxyNode::Http {
+            addr: HostPort::new("127.0.0.1", 8080).unwrap(),
+            auth: Some(Credentials {
+                username: "user".to_owned(),
+                password: Some("secret".to_owned()),
+            }),
+        };
+
+        assert_eq!(node.kind(), "http");
+        assert_eq!(node.upstream_addr(), "127.0.0.1:8080");
+        assert_eq!(node.label(), "http://127.0.0.1:8080");
+        assert!(!node.label().contains("secret"));
+
+        let target = TargetAddr::new("example.com", 443).unwrap();
+        let direct = ProxyChoice::Direct;
+        assert_eq!(direct.kind(), "direct");
+        assert_eq!(direct.upstream_addr(&target), "example.com:443");
     }
 
     #[test]
