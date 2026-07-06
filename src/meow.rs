@@ -39,14 +39,14 @@ pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
     for proxy in proxies {
         match build_meow_node(&proxy) {
             Ok(node) => {
-                debug!(node = %node.label(), "complex proxy admitted to native meow backend");
+                debug!(node = %node.label(), "复杂代理已接入原生 meow 后端");
                 nodes.push(node);
             }
             Err(err) => {
                 debug!(
                     node = %proxy.name,
                     kind = %proxy.kind,
-                    "complex proxy is not supported by native meow backend; trying mihomo fallback: {err:#}"
+                    "复杂代理暂不支持原生 meow 后端，转入 Mihomo fallback 队列：{err:#}"
                 );
                 fallback.push(proxy);
             }
@@ -56,7 +56,7 @@ pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
     if !fallback.is_empty() {
         warn!(
             fallback_nodes = fallback.len(),
-            "complex proxies require mihomo fallback or will be skipped if mihomo is disabled; enable debug logs for per-node reasons"
+            "存在需要 Mihomo fallback 的复杂代理；如果 Mihomo 未启用，这些节点会被跳过；打开 debug 日志可查看逐节点原因"
         );
     }
 
@@ -76,7 +76,7 @@ fn build_meow_node(proxy: &MihomoProxyConfig) -> Result<ProxyNode> {
         "snell" => build_snell(proxy, mapping),
         "anytls" => build_anytls(proxy, mapping),
         "ss" | "shadowsocks" => build_shadowsocks(proxy, mapping),
-        _ => bail!("unsupported native complex proxy type {kind}"),
+        _ => bail!("原生复杂代理类型暂不支持：{kind}"),
     }
 }
 
@@ -87,7 +87,7 @@ fn build_vmess(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Resu
     let uuid = uuid_bytes(&required_string(mapping, &["uuid", "id"], &name)?)?;
     let alter_id = u16_field(mapping, &["alterId", "alter-id", "aid"]).unwrap_or(0);
     if alter_id != 0 {
-        bail!("legacy VMess alterId={alter_id} requires mihomo fallback");
+        bail!("旧版 VMess alterId={alter_id} 需要 Mihomo fallback");
     }
     let security = match string_field(mapping, &["cipher", "security", "scy"])
         .unwrap_or_else(|| "auto".to_owned())
@@ -100,7 +100,7 @@ fn build_vmess(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Resu
             meow_proxy::vmess::Security::ChaCha20Poly1305
         }
         "none" | "zero" => meow_proxy::vmess::Security::None,
-        other => bail!("unsupported VMess security {other}"),
+        other => bail!("不支持的 VMess security：{other}"),
     };
     let transport = build_transport_chain(mapping, &server)?;
     let adapter = VmessAdapter::new(
@@ -123,11 +123,11 @@ fn build_vless(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Resu
     if let Some(encryption) = string_field(mapping, &["encryption"])
         && !matches!(encryption.as_str(), "" | "none")
     {
-        bail!("unsupported VLESS encryption {encryption}");
+        bail!("不支持的 VLESS encryption：{encryption}");
     }
     let flow = match string_field(mapping, &["flow"]).as_deref() {
         Some("xtls-rprx-vision") => Some(VlessFlow::XtlsRprxVision),
-        Some(other) => bail!("unsupported VLESS flow {other}"),
+        Some(other) => bail!("不支持的 VLESS flow：{other}"),
         None => None,
     };
     let transport = build_transport_chain(mapping, &server)?;
@@ -151,7 +151,7 @@ fn build_trojan(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Res
         .unwrap_or_default()
         .to_ascii_lowercase();
     if !matches!(network.as_str(), "" | "tcp" | "trojan") {
-        bail!("Trojan over {network} requires mihomo fallback");
+        bail!("Trojan over {network} 需要 Mihomo fallback");
     }
     let password = required_string(mapping, &["password"], &name)?;
     let sni = string_field(mapping, &["sni", "servername"]).unwrap_or_else(|| server.clone());
@@ -187,7 +187,7 @@ fn build_hysteria2(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> 
         down_bps: u64_field(mapping, &["down", "down-mbps"]).unwrap_or(0),
         obfs: match obfs.as_deref() {
             Some("salamander") => Some(Hy2Obfs::Salamander),
-            Some(other) => bail!("unsupported Hysteria2 obfs {other}"),
+            Some(other) => bail!("不支持的 Hysteria2 obfs：{other}"),
             None => None,
         },
         obfs_password: string_field(mapping, &["obfs-password"]),
@@ -212,7 +212,7 @@ fn build_snell(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Resu
         "3" => SnellVersion::V3,
         "4" => SnellVersion::V4,
         "5" => SnellVersion::V5,
-        other => bail!("unsupported Snell version {other}"),
+        other => bail!("不支持的 Snell version：{other}"),
     };
     let obfs = parse_snell_obfs(mapping, &server)?;
     let adapter = SnellAdapter::new(
@@ -259,7 +259,7 @@ fn build_shadowsocks(
         && !is_builtin_obfs_plugin(plugin)
         && plugin != "v2ray-plugin"
     {
-        bail!("Shadowsocks plugin {plugin} requires mihomo fallback");
+        bail!("Shadowsocks plugin {plugin} 需要 Mihomo fallback");
     }
     let adapter = ShadowsocksAdapter::new(
         &name,
@@ -348,7 +348,7 @@ fn build_transport_chain(
             };
             chain.push(Box::new(HttpUpgradeLayer::new(config)));
         }
-        other => bail!("unsupported transport network {other}"),
+        other => bail!("不支持的传输网络：{other}"),
     }
     Ok(chain)
 }
@@ -371,7 +371,7 @@ fn proxy_mapping(proxy: &MihomoProxyConfig) -> Result<&serde_yaml::Mapping> {
     proxy
         .value
         .as_mapping()
-        .ok_or_else(|| anyhow!("complex proxy {} is not a YAML mapping", proxy.name))
+        .ok_or_else(|| anyhow!("复杂代理 {} 不是 YAML mapping", proxy.name))
 }
 
 fn node_name(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> String {
@@ -379,22 +379,22 @@ fn node_name(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> String
 }
 
 fn required_string(mapping: &serde_yaml::Mapping, keys: &[&str], name: &str) -> Result<String> {
-    string_field(mapping, keys).ok_or_else(|| anyhow!("proxy {name} missing {}", keys.join("/")))
+    string_field(mapping, keys).ok_or_else(|| anyhow!("代理 {name} 缺少 {}", keys.join("/")))
 }
 
 fn required_port(mapping: &serde_yaml::Mapping, keys: &[&str], name: &str) -> Result<u16> {
-    u16_field(mapping, keys).ok_or_else(|| anyhow!("proxy {name} missing {}", keys.join("/")))
+    u16_field(mapping, keys).ok_or_else(|| anyhow!("代理 {name} 缺少 {}", keys.join("/")))
 }
 
 fn uuid_bytes(value: &str) -> Result<[u8; 16]> {
     Ok(*Uuid::parse_str(value)
-        .with_context(|| format!("invalid uuid {value}"))?
+        .with_context(|| format!("uuid 无效：{value}"))?
         .as_bytes())
 }
 
 fn validate_tls_server_name(value: &str) -> Result<()> {
     ServerName::try_from(value.to_owned())
-        .with_context(|| format!("invalid TLS server name/SNI {value}"))?;
+        .with_context(|| format!("TLS server name/SNI 无效：{value}"))?;
     Ok(())
 }
 
@@ -423,7 +423,7 @@ fn parse_snell_obfs(mapping: &serde_yaml::Mapping, server: &str) -> Result<Snell
             server: string_field_in(Some(options), &["host", "server"])
                 .unwrap_or_else(|| server.to_owned()),
         }),
-        other => bail!("unsupported Snell obfs mode {other}"),
+        other => bail!("不支持的 Snell obfs 模式：{other}"),
     }
 }
 
@@ -432,7 +432,7 @@ fn parse_reality_config(mapping: &serde_yaml::Mapping) -> Result<Option<RealityC
         return Ok(None);
     };
     let public_key = string_field_in(Some(options), &["public-key", "public_key", "pbk"])
-        .ok_or_else(|| anyhow!("reality-opts missing public-key"))?;
+        .ok_or_else(|| anyhow!("reality-opts 缺少 public-key"))?;
     Ok(Some(RealityConfig {
         public_key: decode_reality_public_key(&public_key)?,
         short_id: decode_reality_short_id(
@@ -458,18 +458,18 @@ fn decode_reality_public_key(value: &str) -> Result<[u8; 32]> {
         };
         return decoded.try_into().map_err(|decoded: Vec<u8>| {
             anyhow!(
-                "reality public-key must decode to 32 bytes, got {}",
+                "reality public-key 解码后必须是 32 字节，实际为 {}",
                 decoded.len()
             )
         });
     }
-    bail!("invalid reality public-key base64")
+    bail!("无效的 reality public-key base64")
 }
 
 fn decode_reality_short_id(value: &str) -> Result<[u8; 8]> {
-    let bytes = decode_hex(value.trim()).context("invalid reality short-id hex")?;
+    let bytes = decode_hex(value.trim()).context("无效的 reality short-id hex")?;
     if bytes.len() > 8 {
-        bail!("reality short-id must be at most 8 bytes");
+        bail!("reality short-id 最多 8 字节");
     }
     let mut short_id = [0_u8; 8];
     short_id[..bytes.len()].copy_from_slice(&bytes);
@@ -481,7 +481,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
     if !value.len().is_multiple_of(2) {
-        bail!("hex string must have an even length");
+        bail!("hex 字符串长度必须为偶数");
     }
     value
         .as_bytes()
@@ -495,7 +495,7 @@ fn hex_nibble(byte: u8) -> Result<u8> {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => bail!("invalid hex digit {}", byte as char),
+        _ => bail!("无效的 hex 字符：{}", byte as char),
     }
 }
 

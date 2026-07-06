@@ -1,11 +1,17 @@
 use std::{
     io,
     net::{IpAddr, Ipv4Addr},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use meow_common::{ConnType, Metadata, Network};
+use rustls::{
+    DigitallySignedStruct, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use shadowsocks::{
     ProxyClientStream,
     config::ServerType,
@@ -16,11 +22,14 @@ use tokio::{
     net::{TcpStream, lookup_host},
     time::timeout,
 };
+use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 use crate::proxy::{Credentials, HostPort, ProxyChoice, ProxyNode, ProxyPool, TargetAddr};
 
 const HTTP_CONNECT_RESPONSE_LIMIT: usize = 16 * 1024;
+static HTTPS_PROXY_TLS: OnceLock<TlsConnector> = OnceLock::new();
+static INSECURE_HTTPS_PROXY_TLS: OnceLock<TlsConnector> = OnceLock::new();
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -57,27 +66,27 @@ impl Connector {
             match attempt {
                 Ok(Ok(stream)) => {
                     self.pool.report_success(&choice);
-                    debug!("connected to {target} via {label}");
+                    debug!("已通过 {label} 连接到 {target}");
                     return Ok(stream);
                 }
                 Ok(Err(err)) => {
-                    warn!("failed to connect to {target} via {label}: {err}");
+                    warn!("通过 {label} 连接到 {target} 失败：{err}");
                     self.pool.report_failure(&choice);
                     last_error = Some(err);
                 }
                 Err(_) => {
                     let err = io::Error::new(
                         io::ErrorKind::TimedOut,
-                        format!("connect timeout after {:?}", self.connect_timeout),
+                        format!("连接超时，耗时 {:?}", self.connect_timeout),
                     );
-                    warn!("failed to connect to {target} via {label}: {err}");
+                    warn!("通过 {label} 连接到 {target} 失败：{err}");
                     self.pool.report_failure(&choice);
                     last_error = Some(err);
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| io::Error::other("no outbound route available")))
+        Err(last_error.unwrap_or_else(|| io::Error::other("没有可用出站路由")))
     }
 
     async fn connect_once(
@@ -104,7 +113,7 @@ pub async fn connect_via_proxy_node(
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("connect timeout after {connect_timeout:?}"),
+            format!("连接超时，耗时 {connect_timeout:?}"),
         )),
     }
 }
@@ -116,6 +125,21 @@ async fn connect_proxy_node(
 ) -> io::Result<BoxedStream> {
     match proxy {
         ProxyNode::Http { addr, auth } => connect_http_proxy(addr, auth.as_ref(), target).await,
+        ProxyNode::Https {
+            addr,
+            auth,
+            sni,
+            skip_cert_verify,
+        } => {
+            connect_https_proxy(
+                addr,
+                auth.as_ref(),
+                sni.as_deref(),
+                *skip_cert_verify,
+                target,
+            )
+            .await
+        }
         ProxyNode::Socks5 {
             addr,
             auth,
@@ -142,7 +166,7 @@ async fn connect_proxy_node(
                 .adapter
                 .dial_tcp(&metadata)
                 .await
-                .map_err(|err| io::Error::other(format!("meow proxy dial failed: {err}")))?;
+                .map_err(|err| io::Error::other(format!("meow 代理拨号失败：{err}")))?;
             Ok(Box::new(stream))
         }
     }
@@ -177,7 +201,38 @@ async fn connect_http_proxy(
     auth: Option<&Credentials>,
     target: &TargetAddr,
 ) -> io::Result<BoxedStream> {
-    let mut stream = connect_proxy_tcp(addr).await?;
+    let stream = connect_proxy_tcp(addr).await?;
+    connect_http_tunnel(stream, auth, target).await
+}
+
+async fn connect_https_proxy(
+    addr: &HostPort,
+    auth: Option<&Credentials>,
+    sni: Option<&str>,
+    skip_cert_verify: bool,
+    target: &TargetAddr,
+) -> io::Result<BoxedStream> {
+    let stream = connect_proxy_tcp(addr).await?;
+    let connector = https_proxy_tls_connector(skip_cert_verify)?;
+    let server_name =
+        ServerName::try_from(sni.unwrap_or(&addr.host).to_owned()).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("HTTPS 代理 TLS server name/SNI 无效：{err}"),
+            )
+        })?;
+    let stream = connector.connect(server_name, stream).await?;
+    connect_http_tunnel(stream, auth, target).await
+}
+
+async fn connect_http_tunnel<S>(
+    mut stream: S,
+    auth: Option<&Credentials>,
+    target: &TargetAddr,
+) -> io::Result<BoxedStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut request =
         format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: Keep-Alive\r\n");
     if let Some(auth) = auth {
@@ -193,7 +248,87 @@ async fn connect_http_proxy(
     Ok(Box::new(stream))
 }
 
-async fn read_http_header(stream: &mut TcpStream, limit: usize) -> io::Result<Vec<u8>> {
+#[derive(Debug)]
+struct InsecureHttpsProxyCertVerifier;
+
+impl ServerCertVerifier for InsecureHttpsProxyCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn https_proxy_tls_connector(skip_cert_verify: bool) -> io::Result<TlsConnector> {
+    let cell = if skip_cert_verify {
+        &INSECURE_HTTPS_PROXY_TLS
+    } else {
+        &HTTPS_PROXY_TLS
+    };
+    if let Some(connector) = cell.get() {
+        return Ok(connector.clone());
+    }
+
+    let connector = build_https_proxy_tls_connector(skip_cert_verify)?;
+    let _ = cell.set(connector);
+    Ok(cell
+        .get()
+        .expect("HTTPS proxy TLS connector should be initialized")
+        .clone())
+}
+
+fn build_https_proxy_tls_connector(skip_cert_verify: bool) -> io::Result<TlsConnector> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let wants_verifier = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| io::Error::other(format!("rustls 协议初始化失败：{err}")))?;
+
+    let builder = if skip_cert_verify {
+        wants_verifier
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureHttpsProxyCertVerifier))
+    } else {
+        let root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        wants_verifier.with_root_certificates(root_store)
+    };
+
+    Ok(TlsConnector::from(Arc::new(builder.with_no_client_auth())))
+}
+
+async fn read_http_header<S>(stream: &mut S, limit: usize) -> io::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
     let mut header = Vec::with_capacity(512);
     let mut byte = [0_u8; 1];
     while header.len() < limit {
@@ -201,7 +336,7 @@ async fn read_http_header(stream: &mut TcpStream, limit: usize) -> io::Result<Ve
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "connection closed before HTTP header finished",
+                "连接在 HTTP 头读取完成前关闭",
             ));
         }
         header.push(byte[0]);
@@ -211,7 +346,7 @@ async fn read_http_header(stream: &mut TcpStream, limit: usize) -> io::Result<Ve
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "HTTP header exceeded limit",
+        "HTTP 头超过大小限制",
     ))
 }
 
@@ -220,18 +355,18 @@ fn validate_http_connect_response(response: &[u8]) -> io::Result<()> {
     let status_line = text
         .lines()
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty HTTP response"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "HTTP 响应为空"))?;
     let mut parts = status_line.split_whitespace();
     let version = parts.next().unwrap_or_default();
     let status = parts
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "HTTP 响应缺少状态码"))?;
     let status: u16 = status
         .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP status"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP 状态码无效"))?;
     if !version.starts_with("HTTP/") || !(200..300).contains(&status) {
         return Err(io::Error::other(format!(
-            "HTTP proxy CONNECT failed: {status_line}"
+            "HTTP 代理 CONNECT 失败：{status_line}"
         )));
     }
     Ok(())
@@ -270,22 +405,19 @@ async fn socks5_authenticate(stream: &mut TcpStream, auth: Option<&Credentials>)
     if response[0] != 0x05 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid SOCKS5 auth response version",
+            "SOCKS5 认证响应版本无效",
         ));
     }
 
     match response[1] {
         0x00 => Ok(()),
         0x02 => {
-            let auth =
-                auth.ok_or_else(|| io::Error::other("SOCKS5 proxy requires authentication"))?;
+            let auth = auth.ok_or_else(|| io::Error::other("SOCKS5 代理要求认证"))?;
             send_socks5_password_auth(stream, auth).await
         }
-        0xff => Err(io::Error::other(
-            "SOCKS5 proxy rejected authentication methods",
-        )),
+        0xff => Err(io::Error::other("SOCKS5 代理拒绝认证方法")),
         method => Err(io::Error::other(format!(
-            "unsupported SOCKS5 auth method {method:#x}"
+            "不支持的 SOCKS5 认证方法 {method:#x}"
         ))),
     }
 }
@@ -296,7 +428,7 @@ async fn send_socks5_password_auth(stream: &mut TcpStream, auth: &Credentials) -
     if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "SOCKS5 username/password is too long",
+            "SOCKS5 用户名或密码过长",
         ));
     }
 
@@ -311,9 +443,7 @@ async fn send_socks5_password_auth(stream: &mut TcpStream, auth: &Credentials) -
     let mut response = [0_u8; 2];
     stream.read_exact(&mut response).await?;
     if response != [0x01, 0x00] {
-        return Err(io::Error::other(
-            "SOCKS5 username/password authentication failed",
-        ));
+        return Err(io::Error::other("SOCKS5 用户名/密码认证失败"));
     }
     Ok(())
 }
@@ -327,7 +457,7 @@ fn encode_socks5_domain_or_ip(target: &TargetAddr) -> io::Result<Vec<u8>> {
     if host.len() > u8::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "SOCKS5 domain name is too long",
+            "SOCKS5 域名过长",
         ));
     }
     let mut out = Vec::with_capacity(1 + 1 + host.len() + 2);
@@ -344,9 +474,9 @@ async fn encode_socks5_resolved(target: &TargetAddr) -> io::Result<Vec<u8>> {
     }
 
     let mut addrs = lookup_host((target.host.as_str(), target.port)).await?;
-    let addr = addrs.next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "DNS lookup returned no addresses")
-    })?;
+    let addr = addrs
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "DNS 查询未返回地址"))?;
     Ok(encode_socks5_ip(addr.ip(), target.port))
 }
 
@@ -375,12 +505,12 @@ async fn read_socks5_connect_response(stream: &mut TcpStream) -> io::Result<()> 
     if head[0] != 0x05 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid SOCKS5 connect response version",
+            "SOCKS5 连接响应版本无效",
         ));
     }
     if head[1] != 0x00 {
         return Err(io::Error::other(format!(
-            "SOCKS5 connect failed with reply {:#x}",
+            "SOCKS5 连接失败，响应码 {:#x}",
             head[1]
         )));
     }
@@ -403,7 +533,7 @@ async fn read_socks5_connect_response(stream: &mut TcpStream) -> io::Result<()> 
         atyp => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported SOCKS5 response address type {atyp:#x}"),
+                format!("不支持的 SOCKS5 响应地址类型 {atyp:#x}"),
             ));
         }
     }
@@ -442,7 +572,7 @@ async fn connect_socks4_proxy(
     stream.read_exact(&mut response).await?;
     if response[1] != 90 {
         return Err(io::Error::other(format!(
-            "SOCKS4 connect failed with reply {}",
+            "SOCKS4 连接失败，响应码 {}",
             response[1]
         )));
     }
@@ -456,7 +586,7 @@ async fn resolve_ipv4(target: &TargetAddr) -> io::Result<Ipv4Addr> {
     if target.host.parse::<IpAddr>().is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "SOCKS4 does not support IPv6 targets",
+            "SOCKS4 不支持 IPv6 目标",
         ));
     }
 
@@ -466,12 +596,7 @@ async fn resolve_ipv4(target: &TargetAddr) -> io::Result<Ipv4Addr> {
             IpAddr::V4(ip) => Some(ip),
             IpAddr::V6(_) => None,
         })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "DNS lookup returned no IPv4 address",
-            )
-        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "DNS 查询未返回 IPv4 地址"))
 }
 
 #[cfg(test)]

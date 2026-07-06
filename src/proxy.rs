@@ -27,7 +27,7 @@ impl HostPort {
     pub fn new(host: impl Into<String>, port: u16) -> Result<Self> {
         let host = host.into();
         if host.trim().is_empty() {
-            bail!("host must not be empty");
+            bail!("host 不能为空");
         }
         Ok(Self { host, port })
     }
@@ -72,6 +72,12 @@ pub enum ProxyNode {
         addr: HostPort,
         auth: Option<Credentials>,
     },
+    Https {
+        addr: HostPort,
+        auth: Option<Credentials>,
+        sni: Option<String>,
+        skip_cert_verify: bool,
+    },
     Socks5 {
         addr: HostPort,
         auth: Option<Credentials>,
@@ -98,6 +104,7 @@ impl ProxyNode {
     pub fn label(&self) -> String {
         match self {
             Self::Http { addr, .. } => format!("http://{addr}"),
+            Self::Https { addr, .. } => format!("https://{addr}"),
             Self::Socks5 {
                 addr, remote_dns, ..
             } => {
@@ -119,6 +126,17 @@ impl ProxyNode {
     pub fn key(&self) -> String {
         match self {
             Self::Http { addr, auth } => format!("http://{}{}", auth_key(auth.as_ref()), addr),
+            Self::Https {
+                addr,
+                auth,
+                sni,
+                skip_cert_verify,
+            } => format!(
+                "https://{}{}?sni={}&skip-cert-verify={skip_cert_verify}",
+                auth_key(auth.as_ref()),
+                addr,
+                sni.as_deref().unwrap_or("")
+            ),
             Self::Socks5 {
                 addr,
                 auth,
@@ -175,7 +193,7 @@ impl TargetAddr {
     pub fn new(host: impl Into<String>, port: u16) -> Result<Self> {
         let host = host.into();
         if host.trim().is_empty() {
-            bail!("target host must not be empty");
+            bail!("目标 host 不能为空");
         }
         Ok(Self { host, port })
     }
@@ -183,18 +201,18 @@ impl TargetAddr {
     pub fn parse(authority: &str, default_port: Option<u16>) -> Result<Self> {
         let authority = authority.trim();
         if authority.is_empty() {
-            bail!("empty target authority");
+            bail!("目标 authority 为空");
         }
 
         if let Some(rest) = authority.strip_prefix('[') {
             let end = rest
                 .find(']')
-                .ok_or_else(|| anyhow!("invalid IPv6 authority {authority}"))?;
+                .ok_or_else(|| anyhow!("IPv6 authority 无效：{authority}"))?;
             let host = &rest[..end];
             let after = &rest[end + 1..];
             let port = match after.strip_prefix(':') {
                 Some(port) => port.parse()?,
-                None => default_port.ok_or_else(|| anyhow!("missing port in {authority}"))?,
+                None => default_port.ok_or_else(|| anyhow!("authority 缺少端口：{authority}"))?,
             };
             return Self::new(host, port);
         }
@@ -205,7 +223,7 @@ impl TargetAddr {
             return Self::new(host, port.parse()?);
         }
 
-        let port = default_port.ok_or_else(|| anyhow!("missing port in {authority}"))?;
+        let port = default_port.ok_or_else(|| anyhow!("authority 缺少端口：{authority}"))?;
         Self::new(authority, port)
     }
 
@@ -332,7 +350,7 @@ impl ProxyPool {
             let mut failures = shard.lock().expect("proxy failure lock poisoned");
             failures.retain(|key, _| live_keys.contains(key));
         }
-        info!("active proxy pool swapped, active_nodes={new_len}");
+        info!("活动代理池已切换，active_nodes={new_len}");
     }
 
     pub fn candidates(&self) -> Vec<ProxyChoice> {
@@ -367,7 +385,7 @@ impl ProxyPool {
         };
         let mut failures = self.failure_shard(&entry.key);
         if failures.remove(&entry.key).is_some() {
-            debug!(node = %entry.label, "proxy runtime failure counter reset after success");
+            debug!(node = %entry.label, "代理运行时失败计数已在成功后重置");
         }
     }
 
@@ -393,14 +411,14 @@ impl ProxyPool {
             warn!(
                 node = %entry.label,
                 cooldown_seconds = self.inner.cooldown.as_secs(),
-                "proxy entered cooldown after repeated runtime failures"
+                "代理连续运行失败，已进入冷却期"
             );
         } else {
             warn!(
                 node = %entry.label,
                 failures = record.failures,
                 threshold = self.inner.runtime_failure_threshold,
-                "proxy runtime failure recorded"
+                "已记录代理运行时失败"
             );
         }
     }
@@ -431,11 +449,11 @@ impl ProxyPool {
             return false;
         };
         if until > now {
-            debug!(node = %entry.label, "skipping proxy in cooldown");
+            debug!(node = %entry.label, "代理仍在冷却期，已跳过");
             return true;
         }
         failures.remove(&entry.key);
-        debug!(node = %entry.label, "proxy cooldown expired");
+        debug!(node = %entry.label, "代理冷却期已结束");
         false
     }
 }

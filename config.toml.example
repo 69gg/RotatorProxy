@@ -5,6 +5,8 @@
 listen = "127.0.0.1:7890"
 
 # Files or directories to scan for outbound proxies.
+# Plain proxy lines can include HTTP, HTTPS, SOCKS4/5, Shadowsocks, and common
+# Clash-compatible URI formats.
 # Directories are scanned non-recursively and files are processed in sorted order.
 proxy_dirs = ["./proxies"]
 
@@ -19,7 +21,7 @@ connect_timeout_ms = 10000
 subscription_timeout_ms = 15000
 
 # User-Agent sent when fetching subscription URLs.
-subscription_user_agent = "RotatorProxy/0.1"
+subscription_user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # Optional proxy used when fetching subscription/Clash config URLs and when
 # auto-downloading Mihomo. This does not affect runtime outbound rotation.
@@ -42,7 +44,8 @@ health_check_attempts = 3
 health_check_timeout_ms = 10000
 
 # Maximum number of proxy nodes checked at the same time.
-health_check_concurrency = 32
+# Large public proxy lists usually need 128-512 to avoid very slow startup.
+health_check_concurrency = 256
 
 # When health_check_url uses https://, keep certificate verification enabled by
 # default. Set this to true only for a private/self-signed health endpoint.

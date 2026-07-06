@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     collections::VecDeque,
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -14,7 +15,7 @@ use base64::{
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
 };
 use percent_encoding::percent_decode_str;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use shadowsocks::{ServerConfig, config::ServerAddr, crypto::CipherKind};
 use tracing::{debug, info, warn};
 use url::{Url, form_urlencoded};
@@ -107,7 +108,7 @@ pub async fn load_proxies_from_paths(
         files.sort();
         for file in files {
             let content = fs::read_to_string(&file)
-                .with_context(|| format!("failed to read proxy source {}", file.display()))?;
+                .with_context(|| format!("读取代理来源失败：{}", file.display()))?;
             let source = file.display().to_string();
             proxies.extend(parse_content_queue(&client, content, source).await?);
         }
@@ -123,38 +124,32 @@ pub fn build_subscription_client(options: &SubscriptionOptions) -> Result<reqwes
         validate_reqwest_proxy_url(proxy)?;
         info!(
             proxy = %redact_proxy_url(proxy),
-            "external fetch proxy enabled"
+            "已启用配置获取代理"
         );
         builder = builder.proxy(reqwest::Proxy::all(proxy).with_context(|| {
-            format!("invalid subscription_proxy URL {}", redact_proxy_url(proxy))
+            format!("subscription_proxy URL 无效：{}", redact_proxy_url(proxy))
         })?);
     }
-    builder
-        .build()
-        .context("failed to build subscription HTTP client")
+    builder.build().context("构建订阅 HTTP 客户端失败")
 }
 
 fn validate_reqwest_proxy_url(proxy: &str) -> Result<()> {
     if proxy.is_empty() {
-        return Err(anyhow!("subscription_proxy must not be empty"));
+        return Err(anyhow!("subscription_proxy 不能为空"));
     }
-    let url =
-        Url::parse(proxy).with_context(|| format!("invalid subscription_proxy URL {proxy}"))?;
+    let url = Url::parse(proxy).with_context(|| format!("subscription_proxy URL 无效：{proxy}"))?;
     if !supported_subscription_proxy_scheme(url.scheme()) {
-        return Err(anyhow!(
-            "subscription_proxy scheme {} is not supported",
-            url.scheme()
-        ));
+        return Err(anyhow!("subscription_proxy 协议不受支持：{}", url.scheme()));
     }
     if url.host_str().is_none() {
-        return Err(anyhow!("subscription_proxy must include a host"));
+        return Err(anyhow!("subscription_proxy 必须包含 host"));
     }
     Ok(())
 }
 
 fn redact_proxy_url(proxy: &str) -> String {
     let Ok(mut url) = Url::parse(proxy) else {
-        return "<invalid>".to_owned();
+        return "<无效>".to_owned();
     };
     if !url.username().is_empty() {
         let _ = url.set_username("redacted");
@@ -167,23 +162,19 @@ fn redact_proxy_url(proxy: &str) -> String {
 
 fn collect_source_files(path: &Path) -> Result<Vec<PathBuf>> {
     if !path.exists() {
-        warn!("proxy source path does not exist: {}", path.display());
+        warn!("代理来源路径不存在：{}", path.display());
         return Ok(Vec::new());
     }
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
     }
     if !path.is_dir() {
-        warn!(
-            "proxy source path is not a file or directory: {}",
-            path.display()
-        );
+        warn!("代理来源路径不是文件或目录：{}", path.display());
         return Ok(Vec::new());
     }
 
     let mut files = Vec::new();
-    for entry in fs::read_dir(path)
-        .with_context(|| format!("failed to read directory {}", path.display()))?
+    for entry in fs::read_dir(path).with_context(|| format!("读取目录失败：{}", path.display()))?
     {
         let entry = entry?;
         let entry_path = entry.path();
@@ -222,13 +213,13 @@ async fn parse_content_queue(
 
         if item.depth >= MAX_SUBSCRIPTION_DEPTH {
             for url in parsed.subscription_urls {
-                warn!("subscription depth limit reached, skipping {url}");
+                warn!("订阅展开深度已达到上限，跳过 {url}");
             }
             continue;
         }
 
         for url in parsed.subscription_urls {
-            debug!("fetching subscription {url}");
+            debug!("正在获取订阅 {url}");
             match fetch_subscription(client, &url).await {
                 Ok(body) => queue.push_back(QueuedContent {
                     content: body,
@@ -236,7 +227,7 @@ async fn parse_content_queue(
                     depth: item.depth + 1,
                     allow_subscriptions: false,
                 }),
-                Err(err) => warn!("failed to fetch subscription {url}: {err:#}"),
+                Err(err) => warn!("订阅获取失败 {url}：{err:#}"),
             }
         }
     }
@@ -249,13 +240,13 @@ async fn fetch_subscription(client: &reqwest::Client, url: &str) -> Result<Strin
         .get(url)
         .send()
         .await
-        .with_context(|| format!("failed to fetch subscription {url}"))?
+        .with_context(|| format!("获取订阅失败：{url}"))?
         .error_for_status()
-        .with_context(|| format!("subscription returned non-success status {url}"))?;
+        .with_context(|| format!("订阅返回非成功状态：{url}"))?;
     response
         .text()
         .await
-        .with_context(|| format!("failed to read subscription body {url}"))
+        .with_context(|| format!("读取订阅响应体失败：{url}"))
 }
 
 struct QueuedContent {
@@ -270,6 +261,12 @@ struct LocalParseResult {
     proxies: LoadedProxySet,
     subscription_urls: Vec<String>,
     decoded_contents: Vec<String>,
+}
+
+#[derive(Default)]
+struct ParseIssueStats {
+    invalid_lines: usize,
+    unsupported_lines: usize,
 }
 
 fn parse_local_content(
@@ -292,6 +289,7 @@ fn parse_local_content(
     }
 
     let mut result = LocalParseResult::default();
+    let mut issues = ParseIssueStats::default();
     for (index, line) in content.lines().enumerate() {
         let Some(line) = normalize_source_line(line) else {
             continue;
@@ -303,18 +301,27 @@ fn parse_local_content(
             Ok(None) if allow_subscriptions && is_subscription_url(line) => {
                 result.subscription_urls.push(line.to_owned());
             }
-            Ok(None) => warn!(
-                "unsupported proxy source line {}:{}: {}",
-                source,
-                index + 1,
-                line
-            ),
+            Ok(None) => {
+                issues.unsupported_lines += 1;
+                debug!("不支持的代理来源行 {}:{}：{}", source, index + 1, line);
+            }
             Err(err) if allow_subscriptions && is_subscription_url(line) => {
-                debug!("treating line as subscription URL after proxy parse miss: {err}");
+                debug!("代理解析未命中，按订阅 URL 处理该行：{err}");
                 result.subscription_urls.push(line.to_owned());
             }
-            Err(err) => warn!("invalid proxy source line {}:{}: {err}", source, index + 1),
+            Err(err) => {
+                issues.invalid_lines += 1;
+                debug!("无效的代理来源行 {}:{}：{err}", source, index + 1);
+            }
         }
+    }
+    if issues.invalid_lines > 0 || issues.unsupported_lines > 0 {
+        warn!(
+            source,
+            invalid_lines = issues.invalid_lines,
+            unsupported_lines = issues.unsupported_lines,
+            "代理来源中存在无法解析的行，已跳过；打开 debug 日志可查看逐行明细"
+        );
     }
     Ok(result)
 }
@@ -360,13 +367,7 @@ pub fn parse_proxy_url(line: &str) -> Result<Option<ProxyNode>> {
     }
 
     if line.starts_with("ss://") {
-        let server =
-            ServerConfig::from_url(line).map_err(|err| anyhow!("invalid ss URL: {err}"))?;
-        let label = Url::parse(line)
-            .ok()
-            .and_then(|url| url.fragment().map(decode_url_component))
-            .filter(|fragment| !fragment.is_empty())
-            .unwrap_or_else(|| "ss".to_owned());
+        let (server, label) = parse_shadowsocks_url(line)?;
         return Ok(Some(ProxyNode::Shadowsocks {
             server: Arc::new(server),
             label,
@@ -390,12 +391,27 @@ pub fn parse_proxy_url(line: &str) -> Result<Option<ProxyNode>> {
                 auth: credentials_from_url(&url),
             }))
         }
-        "socks5" | "socks5h" => {
+        "https" => {
+            if !looks_like_https_proxy_url(&url) {
+                return Ok(None);
+            }
+            let addr = host_port_from_url(&url)?;
+            Ok(Some(ProxyNode::Https {
+                addr,
+                auth: credentials_from_url(&url),
+                sni: query_param(&url, "sni").or_else(|| query_param(&url, "servername")),
+                skip_cert_verify: query_param(&url, "allowInsecure")
+                    .or_else(|| query_param(&url, "skip-cert-verify"))
+                    .or_else(|| query_param(&url, "insecure"))
+                    .is_some_and(|value| matches!(value.as_str(), "1" | "true")),
+            }))
+        }
+        "socks" | "socks5" | "socks5h" => {
             let addr = host_port_from_url(&url)?;
             Ok(Some(ProxyNode::Socks5 {
                 addr,
-                auth: credentials_from_url(&url),
-                remote_dns: scheme == "socks5h",
+                auth: socks_credentials_from_url(&url),
+                remote_dns: scheme != "socks5",
             }))
         }
         "socks4" | "socks4a" => {
@@ -407,6 +423,111 @@ pub fn parse_proxy_url(line: &str) -> Result<Option<ProxyNode>> {
             }))
         }
         _ => Ok(None),
+    }
+}
+
+fn parse_shadowsocks_url(line: &str) -> Result<(ServerConfig, String)> {
+    let label = Url::parse(line)
+        .ok()
+        .and_then(|url| url.fragment().map(decode_url_component))
+        .filter(|fragment| !fragment.is_empty())
+        .unwrap_or_else(|| "ss".to_owned());
+
+    if let Ok(url) = Url::parse(line)
+        && url.host_str().is_some()
+        && url.port().is_some()
+    {
+        let host = required_host(&url, "ss")?;
+        let port = required_port(&url, "ss")?;
+        let (method, password) = ss_credentials_from_url(&url)?;
+        let server = shadowsocks_server(host, port, method, password)?;
+        return Ok((server, label));
+    }
+
+    let encoded = line
+        .trim_start_matches("ss://")
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .split('?')
+        .next()
+        .unwrap_or_default();
+    let decoded = decode_base64_text(encoded).ok_or_else(|| anyhow!("无效的 ss URL"))?;
+    let (method, password, host, port) = parse_ss_legacy_authority(&decoded)?;
+    let server = shadowsocks_server(host, port, method, password)?;
+    Ok((server, label))
+}
+
+fn shadowsocks_server(
+    host: String,
+    port: u16,
+    method: String,
+    password: String,
+) -> Result<ServerConfig> {
+    let method = normalize_ss_cipher(&method);
+    let method = CipherKind::from_str(&method)
+        .map_err(|err| anyhow!("无效的 Shadowsocks cipher {method}：{err:?}"))?;
+    Ok(ServerConfig::new(
+        ServerAddr::DomainName(host, port),
+        password,
+        method,
+    )?)
+}
+
+fn ss_credentials_from_url(url: &Url) -> Result<(String, String)> {
+    let username = decode_url_component(url.username());
+    if let Some(password) = url.password().map(decode_url_component) {
+        return Ok((username, password));
+    }
+
+    let credentials = decode_base64_text(url.username())
+        .or_else(|| decode_base64_text(&username))
+        .unwrap_or(username);
+    split_credentials(&credentials).ok_or_else(|| anyhow!("ss URL 缺少 method/password"))
+}
+
+fn parse_ss_legacy_authority(value: &str) -> Result<(String, String, String, u16)> {
+    let (userinfo, server) = value
+        .rsplit_once('@')
+        .ok_or_else(|| anyhow!("ss URL 缺少 server"))?;
+    let (method, password) =
+        split_credentials(userinfo).ok_or_else(|| anyhow!("ss URL 缺少 method/password"))?;
+    let (host, port) = split_host_port(server)?;
+    Ok((method, password, host, port))
+}
+
+fn split_credentials(value: &str) -> Option<(String, String)> {
+    let (username, password) = value.split_once(':')?;
+    Some((
+        decode_url_component(username),
+        decode_url_component(password),
+    ))
+}
+
+fn split_host_port(value: &str) -> Result<(String, u16)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| anyhow!("IPv6 地址格式无效：{value}"))?;
+        let host = &rest[..end];
+        let port = rest[end + 1..]
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow!("地址缺少 port：{value}"))?
+            .parse::<u16>()?;
+        return Ok((host.to_owned(), port));
+    }
+
+    let (host, port) = value
+        .rsplit_once(':')
+        .filter(|(host, _)| !host.contains(':') || host.parse::<IpAddr>().is_ok())
+        .ok_or_else(|| anyhow!("地址缺少 port：{value}"))?;
+    Ok((host.to_owned(), port.parse::<u16>()?))
+}
+
+fn normalize_ss_cipher(method: &str) -> String {
+    match method.to_ascii_lowercase().as_str() {
+        "chacha20-poly1305" => "chacha20-ietf-poly1305".to_owned(),
+        other => other.to_owned(),
     }
 }
 
@@ -438,24 +559,18 @@ fn parse_mihomo_proxy_url(line: &str) -> Result<Option<MihomoProxyConfig>> {
 }
 
 fn parse_vmess_url(encoded: &str) -> Result<MihomoProxyConfig> {
-    let decoded = decode_base64_text(encoded).context("invalid vmess base64 payload")?;
-    let link: VmessLink = serde_json::from_str(&decoded).context("invalid vmess JSON payload")?;
+    let decoded = decode_base64_text(encoded).context("无效的 vmess base64 内容")?;
+    let link: VmessLink = serde_json::from_str(&decoded).context("无效的 vmess JSON 内容")?;
     let name = non_empty(link.ps).unwrap_or_else(|| {
         format!(
             "vmess-{}",
             non_empty(link.add.clone()).unwrap_or_else(|| "node".to_owned())
         )
     });
-    let server = non_empty(link.add).ok_or_else(|| anyhow!("vmess link missing server"))?;
+    let server = non_empty(link.add).ok_or_else(|| anyhow!("vmess 链接缺少 server"))?;
     let port = parse_u16_string(&link.port, "vmess port")?;
-    let uuid = non_empty(link.id).ok_or_else(|| anyhow!("vmess link missing id"))?;
-    let alter_id = link
-        .aid
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("0")
-        .parse::<u16>()
-        .context("invalid vmess alterId")?;
+    let uuid = non_empty(link.id).ok_or_else(|| anyhow!("vmess 链接缺少 id"))?;
+    let alter_id = parse_vmess_alter_id(link.aid.as_deref())?;
 
     let mut proxy = ClashProxyDocument::new(name, "vmess", server, port);
     proxy.insert_string("uuid", uuid);
@@ -483,7 +598,7 @@ fn parse_vless_url(url: &Url) -> Result<MihomoProxyConfig> {
     let port = required_port(url, "vless")?;
     let uuid = decode_url_component(url.username());
     if uuid.is_empty() {
-        return Err(anyhow!("vless link missing uuid"));
+        return Err(anyhow!("vless 链接缺少 uuid"));
     }
 
     let mut proxy = ClashProxyDocument::new(name, "vless", server, port);
@@ -503,7 +618,7 @@ fn parse_trojan_url(url: &Url) -> Result<MihomoProxyConfig> {
     let port = required_port(url, "trojan")?;
     let password = decode_url_component(url.username());
     if password.is_empty() {
-        return Err(anyhow!("trojan link missing password"));
+        return Err(anyhow!("trojan 链接缺少 password"));
     }
 
     let mut proxy = ClashProxyDocument::new(name, "trojan", server, port);
@@ -519,7 +634,7 @@ fn parse_hysteria2_url(url: &Url) -> Result<MihomoProxyConfig> {
     let port = required_port(url, "hysteria2")?;
     let password = decode_url_component(url.username());
     if password.is_empty() {
-        return Err(anyhow!("hysteria2 link missing password"));
+        return Err(anyhow!("hysteria2 链接缺少 password"));
     }
 
     let mut proxy = ClashProxyDocument::new(name, "hysteria2", server, port);
@@ -541,7 +656,7 @@ fn parse_tuic_url(url: &Url) -> Result<MihomoProxyConfig> {
     let uuid = url.username();
     let password = url
         .password()
-        .ok_or_else(|| anyhow!("tuic link username must be uuid:password"))?;
+        .ok_or_else(|| anyhow!("tuic 链接用户名必须是 uuid:password"))?;
 
     let mut proxy = ClashProxyDocument::new(name, "tuic", server, port);
     proxy.insert_string("uuid", decode_url_component(uuid));
@@ -562,7 +677,7 @@ fn parse_anytls_url(url: &Url) -> Result<MihomoProxyConfig> {
         .map(decode_url_component)
         .or_else(|| query_param(url, "password"))
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("anytls link missing password"))?;
+        .ok_or_else(|| anyhow!("anytls 链接缺少 password"))?;
 
     let mut proxy = ClashProxyDocument::new(name, "anytls", server, port);
     proxy.insert_string("password", password);
@@ -577,38 +692,38 @@ fn parse_anytls_url(url: &Url) -> Result<MihomoProxyConfig> {
 }
 
 fn parse_ssr_url(encoded: &str) -> Result<MihomoProxyConfig> {
-    let decoded = decode_base64_text(encoded).context("invalid ssr base64 payload")?;
+    let decoded = decode_base64_text(encoded).context("无效的 ssr base64 内容")?;
     let (main, query) = decoded.split_once("/?").unwrap_or((&decoded, ""));
     let mut parts = main.splitn(6, ':');
     let server = parts
         .next()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("ssr link missing server"))?
+        .ok_or_else(|| anyhow!("ssr 链接缺少 server"))?
         .to_owned();
     let port = parts
         .next()
-        .ok_or_else(|| anyhow!("ssr link missing port"))?
+        .ok_or_else(|| anyhow!("ssr 链接缺少 port"))?
         .parse::<u16>()
-        .context("invalid ssr port")?;
+        .context("无效的 ssr port")?;
     let protocol = parts
         .next()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("ssr link missing protocol"))?
+        .ok_or_else(|| anyhow!("ssr 链接缺少 protocol"))?
         .to_owned();
     let cipher = parts
         .next()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("ssr link missing cipher"))?
+        .ok_or_else(|| anyhow!("ssr 链接缺少 cipher"))?
         .to_owned();
     let obfs = parts
         .next()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("ssr link missing obfs"))?
+        .ok_or_else(|| anyhow!("ssr 链接缺少 obfs"))?
         .to_owned();
     let password = parts
         .next()
         .and_then(decode_base64_text)
-        .ok_or_else(|| anyhow!("ssr link missing password"))?;
+        .ok_or_else(|| anyhow!("ssr 链接缺少 password"))?;
 
     let params = form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>();
     let name = params
@@ -647,13 +762,25 @@ fn looks_like_http_proxy_url(url: &Url) -> bool {
         && url.fragment().is_none()
 }
 
+fn looks_like_https_proxy_url(url: &Url) -> bool {
+    url.port().is_some()
+        && (url.path().is_empty() || url.path() == "/")
+        && (!url.username().is_empty()
+            || url.fragment().is_some()
+            || query_param(url, "sni").is_some()
+            || query_param(url, "servername").is_some()
+            || query_param(url, "allowInsecure").is_some()
+            || query_param(url, "skip-cert-verify").is_some()
+            || query_param(url, "insecure").is_some())
+}
+
 fn host_port_from_url(url: &Url) -> Result<HostPort> {
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow!("missing host in proxy URL"))?;
+        .ok_or_else(|| anyhow!("代理 URL 缺少 host"))?;
     let port = url
         .port()
-        .ok_or_else(|| anyhow!("missing port in proxy URL {url}"))?;
+        .ok_or_else(|| anyhow!("代理 URL 缺少 port：{url}"))?;
     HostPort::new(host, port)
 }
 
@@ -665,6 +792,28 @@ fn credentials_from_url(url: &Url) -> Option<Credentials> {
     Some(Credentials {
         username: decode_url_component(username),
         password: url.password().map(decode_url_component),
+    })
+}
+
+fn socks_credentials_from_url(url: &Url) -> Option<Credentials> {
+    let username = url.username();
+    if username.is_empty() {
+        return None;
+    }
+    if url.password().is_some() {
+        return credentials_from_url(url);
+    }
+
+    let decoded = decode_base64_text(username)
+        .or_else(|| decode_base64_text(&decode_url_component(username)))
+        .and_then(|credentials| split_credentials(&credentials));
+    let (username, password) = decoded?;
+    if username.is_empty() && password.is_empty() {
+        return None;
+    }
+    Some(Credentials {
+        username,
+        password: (!password.is_empty()).then_some(password),
     })
 }
 
@@ -729,31 +878,30 @@ fn parse_clash_yaml(content: &str, source: &str) -> Result<Option<LoadedProxySet
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
-    let config = match serde_yaml::from_value::<ClashConfig>(yaml_value.clone()) {
-        Ok(config) => config,
-        Err(_) => return Ok(None),
-    };
-    let Some(entries) = config.proxies else {
+    let raw_entries = raw_clash_proxy_values(&yaml_value);
+    if raw_entries.is_empty() {
         return Ok(None);
-    };
-    if entries.is_empty() {
-        return Ok(Some(LoadedProxySet::default()));
     }
 
-    let raw_entries = raw_clash_proxy_values(&yaml_value);
     let mut proxies = LoadedProxySet::default();
-    for (index, entry) in entries.into_iter().enumerate() {
+    for (index, value) in raw_entries.into_iter().enumerate() {
+        let entry = match serde_yaml::from_value::<ClashProxy>(value.clone()) {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!(
+                    "来源 {source} 中存在无效 Clash 代理，索引 {}：{err}",
+                    index + 1
+                );
+                continue;
+            }
+        };
         match clash_entry_to_proxy(&entry) {
             Ok(ClashProxyDecision::Native(proxy)) => proxies.native.push(proxy),
             Ok(ClashProxyDecision::Mihomo) => {
-                let Some(value) = raw_entries.get(index).cloned() else {
-                    warn!("missing raw Clash proxy value in {source} at index {index}");
-                    continue;
-                };
-                proxies.mihomo.push(clash_entry_to_mihomo(entry, value));
+                proxies.mihomo.push(clash_entry_to_mihomo(entry, value))
             }
             Ok(ClashProxyDecision::Skip) => {}
-            Err(err) => warn!("invalid Clash proxy in {source}: {err}"),
+            Err(err) => warn!("来源 {source} 中存在无效 Clash 代理：{err}"),
         }
     }
     Ok(Some(proxies))
@@ -775,6 +923,9 @@ enum ClashProxyDecision {
 fn clash_entry_to_proxy(entry: &ClashProxy) -> Result<ClashProxyDecision> {
     let kind = entry.kind.to_ascii_lowercase();
     let name = entry.name.clone().unwrap_or_else(|| kind.clone());
+    if is_clash_group_or_policy_type(&kind) {
+        return Ok(ClashProxyDecision::Skip);
+    }
     if is_mihomo_only_clash_type(&kind) {
         return Ok(ClashProxyDecision::Mihomo);
     }
@@ -807,13 +958,14 @@ fn clash_entry_to_proxy(entry: &ClashProxy) -> Result<ClashProxyDecision> {
                 .cipher
                 .clone()
                 .or(entry.method.clone())
-                .ok_or_else(|| anyhow!("Shadowsocks proxy {name} missing cipher"))?;
+                .ok_or_else(|| anyhow!("Shadowsocks 代理 {name} 缺少 cipher"))?;
             let password = entry
                 .password
                 .clone()
-                .ok_or_else(|| anyhow!("Shadowsocks proxy {name} missing password"))?;
-            let method = CipherKind::from_str(&cipher)
-                .map_err(|err| anyhow!("invalid Shadowsocks cipher {cipher}: {err:?}"))?;
+                .ok_or_else(|| anyhow!("Shadowsocks 代理 {name} 缺少 password"))?;
+            let method = normalize_ss_cipher(&cipher);
+            let method = CipherKind::from_str(&method)
+                .map_err(|err| anyhow!("无效的 Shadowsocks cipher {cipher}：{err:?}"))?;
             let server = ServerConfig::new(ServerAddr::DomainName(server, port), password, method)?;
             Ok(ClashProxyDecision::Native(ProxyNode::Shadowsocks {
                 server: Arc::new(server),
@@ -824,7 +976,7 @@ fn clash_entry_to_proxy(entry: &ClashProxy) -> Result<ClashProxyDecision> {
             if entry.server.is_some() || !entry.extra.is_empty() {
                 Ok(ClashProxyDecision::Mihomo)
             } else {
-                warn!("skipping unsupported Clash proxy {name} of type {kind}");
+                warn!("跳过不支持的 Clash 代理 {name}，类型 {kind}");
                 Ok(ClashProxyDecision::Skip)
             }
         }
@@ -835,10 +987,8 @@ fn clash_server_port(entry: &ClashProxy, name: &str) -> Result<(String, u16)> {
     let server = entry
         .server
         .clone()
-        .ok_or_else(|| anyhow!("proxy {name} missing server"))?;
-    let port = entry
-        .port
-        .ok_or_else(|| anyhow!("proxy {name} missing port"))?;
+        .ok_or_else(|| anyhow!("代理 {name} 缺少 server"))?;
+    let port = entry.port.ok_or_else(|| anyhow!("代理 {name} 缺少 port"))?;
     Ok((server, port))
 }
 
@@ -859,6 +1009,23 @@ fn is_mihomo_only_clash_type(kind: &str) -> bool {
             | "mieru"
             | "snell"
             | "ssh"
+    )
+}
+
+fn is_clash_group_or_policy_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "select"
+            | "url-test"
+            | "fallback"
+            | "load-balance"
+            | "relay"
+            | "direct"
+            | "reject"
+            | "reject-drop"
+            | "pass"
+            | "dns"
+            | "compatible"
     )
 }
 
@@ -1065,12 +1232,11 @@ fn query_param(url: &Url, key: &str) -> Option<String> {
 fn required_host(url: &Url, scheme: &str) -> Result<String> {
     url.host_str()
         .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow!("{scheme} link missing host"))
+        .ok_or_else(|| anyhow!("{scheme} 链接缺少 host"))
 }
 
 fn required_port(url: &Url, scheme: &str) -> Result<u16> {
-    url.port()
-        .ok_or_else(|| anyhow!("{scheme} link missing port"))
+    url.port().ok_or_else(|| anyhow!("{scheme} 链接缺少 port"))
 }
 
 fn proxy_name_from_url(url: &Url, fallback: &str) -> String {
@@ -1087,9 +1253,28 @@ fn non_empty(value: Option<String>) -> Option<String> {
 fn parse_u16_string(value: &Option<String>, label: &str) -> Result<u16> {
     value
         .as_deref()
-        .ok_or_else(|| anyhow!("{label} missing"))?
+        .ok_or_else(|| anyhow!("{label} 缺失"))?
         .parse::<u16>()
-        .with_context(|| format!("invalid {label}"))
+        .with_context(|| format!("{label} 无效"))
+}
+
+fn parse_vmess_alter_id(value: Option<&str>) -> Result<u16> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(0);
+    };
+    if let Ok(value) = value.parse::<u16>() {
+        return Ok(value);
+    }
+    let mut chars = value.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next())
+        && ch.is_control()
+    {
+        let codepoint = ch as u32;
+        if codepoint <= u16::MAX as u32 {
+            return Ok(codepoint as u16);
+        }
+    }
+    Err(anyhow!("无效的 vmess alterId"))
 }
 
 fn credentials_from_parts(
@@ -1102,16 +1287,12 @@ fn credentials_from_parts(
 }
 
 #[derive(Debug, Deserialize)]
-struct ClashConfig {
-    proxies: Option<Vec<ClashProxy>>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ClashProxy {
     name: Option<String>,
     #[serde(rename = "type")]
     kind: String,
     server: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_u16")]
     port: Option<u16>,
     username: Option<String>,
     password: Option<String>,
@@ -1123,12 +1304,35 @@ struct ClashProxy {
     extra: BTreeMap<String, serde_yaml::Value>,
 }
 
+fn deserialize_optional_u16<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_yaml::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    yaml_value_to_u64(&value)
+        .and_then(|value| value.try_into().ok())
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("端口必须是 0-65535 的整数或数字字符串"))
+}
+
+fn yaml_value_to_u64(value: &serde_yaml::Value) -> Option<u64> {
+    match value {
+        serde_yaml::Value::Number(value) => value.as_u64(),
+        serde_yaml::Value::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct VmessLink {
     ps: Option<String>,
     add: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_json_string")]
     port: Option<String>,
     id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_json_string")]
     aid: Option<String>,
     net: Option<String>,
     host: Option<String>,
@@ -1136,6 +1340,22 @@ struct VmessLink {
     tls: Option<String>,
     sni: Option<String>,
     scy: Option<String>,
+}
+
+fn deserialize_optional_json_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => Ok(Some(value)),
+        serde_json::Value::Number(value) => Ok(Some(value.to_string())),
+        serde_json::Value::Bool(value) => Ok(Some(value.to_string())),
+        _ => Err(serde::de::Error::custom("字段必须是字符串、数字或布尔值")),
+    }
 }
 
 #[cfg(test)]
@@ -1193,7 +1413,7 @@ mod tests {
         }
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "test HTTP header exceeded limit",
+            "测试 HTTP 头超过大小限制",
         ))
     }
 
@@ -1236,6 +1456,66 @@ mod tests {
             } => {
                 assert_eq!(addr.port, 1080);
                 assert!(remote_dns);
+            }
+            other => panic!("unexpected proxy: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_socks_alias_with_base64_auth() {
+        let proxy = parse_proxy_url("socks://dXNlcjpwYXNz@127.0.0.1:1080#node")
+            .unwrap()
+            .unwrap();
+        match proxy {
+            ProxyNode::Socks5 {
+                addr,
+                auth,
+                remote_dns,
+            } => {
+                assert_eq!(addr.host, "127.0.0.1");
+                assert_eq!(addr.port, 1080);
+                assert!(remote_dns);
+                let auth = auth.unwrap();
+                assert_eq!(auth.username, "user");
+                assert_eq!(auth.password.as_deref(), Some("pass"));
+            }
+            other => panic!("unexpected proxy: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_https_proxy_url() {
+        let proxy = parse_proxy_url(
+            "https://user:pass@127.0.0.1:8443?sni=proxy.example.com&allowInsecure=1#node",
+        )
+        .unwrap()
+        .unwrap();
+        match proxy {
+            ProxyNode::Https {
+                addr,
+                auth,
+                sni,
+                skip_cert_verify,
+            } => {
+                assert_eq!(addr.host, "127.0.0.1");
+                assert_eq!(addr.port, 8443);
+                assert_eq!(auth.unwrap().username, "user");
+                assert_eq!(sni.as_deref(), Some("proxy.example.com"));
+                assert!(skip_cert_verify);
+            }
+            other => panic!("unexpected proxy: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ss_raw_userinfo_with_cipher_alias() {
+        let proxy = parse_proxy_url("ss://chacha20-poly1305:pass@example.com:8388#ss-a")
+            .unwrap()
+            .unwrap();
+        match &proxy {
+            ProxyNode::Shadowsocks { label, .. } => {
+                assert_eq!(label, "ss-a");
+                assert!(proxy.key().starts_with("ss://chacha20-ietf-poly1305@"));
             }
             other => panic!("unexpected proxy: {other:?}"),
         }
@@ -1368,6 +1648,46 @@ proxies:
     }
 
     #[test]
+    fn clash_yaml_parses_entries_individually_and_skips_groups() {
+        let yaml = r#"
+mixed-port: 7890
+proxy-groups:
+  - name: auto
+    type: url-test
+    proxies:
+      - ss-a
+proxies:
+  - name: ss-a
+    type: ss
+    server: example.com
+    port: '8388'
+    cipher: chacha20-poly1305
+    password: pass
+  - name: bad-port
+    type: http
+    server: 127.0.0.1
+    port: invalid
+  - name: selector-in-proxies
+    type: select
+    proxies:
+      - ss-a
+  - name: vmess-a
+    type: vmess
+    server: example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+"#;
+        let proxies = parse_clash_yaml(yaml, "test").unwrap().unwrap();
+        assert_eq!(proxies.native.len(), 1);
+        assert_eq!(proxies.mihomo.len(), 1);
+        assert_eq!(proxies.mihomo[0].name, "vmess-a");
+        match &proxies.native[0] {
+            ProxyNode::Shadowsocks { label, .. } => assert_eq!(label, "ss-a"),
+            other => panic!("unexpected proxy: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_vless_link_as_mihomo_node() {
         let parsed = parse_proxy_line(
             "vless://00000000-0000-0000-0000-000000000000@example.com:443?security=tls&type=ws&host=cdn.example.com&path=%2Fws#vless-a",
@@ -1384,6 +1704,27 @@ proxies:
                 assert!(text.contains("cdn.example.com"));
             }
             ParsedProxyLine::Native(_) => panic!("expected mihomo node"),
+        }
+    }
+
+    #[test]
+    fn parses_vmess_with_numeric_fields() {
+        let encoded = BASE64_STANDARD.encode(
+            r#"{"v":"2","ps":"vmess-num","add":"example.com","port":443,"id":"00000000-0000-0000-0000-000000000000","aid":"\u0002","net":"tcp","tls":"tls","scy":"auto"}"#,
+        );
+        let parsed = parse_proxy_line(&format!("vmess://{encoded}"))
+            .unwrap()
+            .unwrap();
+
+        match parsed {
+            ParsedProxyLine::Mihomo(proxy) => {
+                assert_eq!(proxy.name, "vmess-num");
+                assert_eq!(proxy.kind, "vmess");
+                let text = serde_yaml::to_string(&proxy.value).unwrap();
+                assert!(text.contains("port: 443"));
+                assert!(text.contains("alterId: 2"));
+            }
+            ParsedProxyLine::Native(_) => panic!("expected complex node"),
         }
     }
 

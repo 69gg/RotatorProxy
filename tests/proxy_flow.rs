@@ -11,6 +11,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
+    time::{sleep, timeout},
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -95,6 +96,80 @@ async fn spawn_http_connect_proxy() -> io::Result<(SocketAddr, JoinHandle<()>)> 
                     .is_ok()
                 {
                     let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    Ok((addr, handle))
+}
+
+async fn spawn_https_connect_proxy() -> io::Result<(SocketAddr, JoinHandle<()>)> {
+    let CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let private_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+    let tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert.der().clone()], private_key)
+    .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut inbound) = acceptor.accept(inbound).await else {
+                    return;
+                };
+                let Ok(header) = read_header(&mut inbound).await else {
+                    return;
+                };
+                let header = String::from_utf8_lossy(&header);
+                let Some(target) = header
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                else {
+                    return;
+                };
+                let Ok(mut outbound) = TcpStream::connect(target).await else {
+                    let _ = inbound
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                };
+                if inbound
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .is_ok()
+                {
+                    let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    Ok((addr, handle))
+}
+
+async fn spawn_stalling_http_connect_proxy() -> io::Result<(SocketAddr, JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                if read_header(&mut inbound).await.is_err() {
+                    return;
+                }
+                if inbound
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .is_ok()
+                {
+                    sleep(Duration::from_secs(5)).await;
                 }
             });
         }
@@ -319,6 +394,85 @@ async fn health_refresh_filters_failed_proxy_and_swaps_pool() -> io::Result<()> 
     assert_eq!(
         labels_from_pool(&pool),
         vec![format!("http://127.0.0.1:{}", good_proxy_addr.port())]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_check_timeout_covers_stalled_response() -> io::Result<()> {
+    let (target_addr, _first_line_rx, _target_handle) = spawn_http_target().await?;
+    let (proxy_addr, _proxy_handle) = spawn_stalling_http_connect_proxy().await?;
+
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!("http://127.0.0.1:{}\n", proxy_addr.port()),
+    )
+    .unwrap();
+
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_url: format!("http://{target_addr}/health"),
+        health_check_attempts: 1,
+        health_check_timeout_ms: 100,
+        health_check_concurrency: 1,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let pool = ProxyPool::with_runtime_options(Vec::new(), 2, 3, Duration::from_secs(60));
+    let mihomo = MihomoManager::new();
+
+    let summary = timeout(
+        Duration::from_secs(2),
+        refresh_proxy_pool(&config, &pool, &mihomo, "test"),
+    )
+    .await
+    .expect("health refresh should not hang on stalled response")
+    .unwrap();
+
+    assert_eq!(summary.loaded, 1);
+    assert_eq!(summary.active, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn health_refresh_accepts_https_proxy() -> io::Result<()> {
+    let (target_addr, _first_line_rx, _target_handle) = spawn_http_target().await?;
+    let (proxy_addr, _proxy_handle) = spawn_https_connect_proxy().await?;
+
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!(
+            "https://127.0.0.1:{}?allowInsecure=1#local\n",
+            proxy_addr.port()
+        ),
+    )
+    .unwrap();
+
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_url: format!("http://{target_addr}/health"),
+        health_check_attempts: 1,
+        health_check_timeout_ms: 1000,
+        health_check_concurrency: 1,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let pool = ProxyPool::with_runtime_options(Vec::new(), 2, 3, Duration::from_secs(60));
+    let mihomo = MihomoManager::new();
+
+    let summary = refresh_proxy_pool(&config, &pool, &mihomo, "test")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.loaded, 1);
+    assert_eq!(summary.active, 1);
+    assert_eq!(
+        labels_from_pool(&pool),
+        vec![format!("https://127.0.0.1:{}", proxy_addr.port())]
     );
     Ok(())
 }

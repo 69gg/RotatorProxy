@@ -12,14 +12,14 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:7890";
 const DEFAULT_MAX_RETRIES: usize = 10;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SUBSCRIPTION_TIMEOUT_MS: u64 = 15_000;
-const DEFAULT_USER_AGENT: &str = "RotatorProxy/0.1";
+const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES: &[&str] =
     &["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_HEALTH_CHECK_URL: &str = "http://example.com/";
 const DEFAULT_HEALTH_CHECK_ATTEMPTS: usize = 3;
 const DEFAULT_HEALTH_CHECK_TIMEOUT_MS: u64 = 10_000;
-const DEFAULT_HEALTH_CHECK_CONCURRENCY: usize = 32;
+const DEFAULT_HEALTH_CHECK_CONCURRENCY: usize = 256;
 const DEFAULT_HEALTH_CHECK_TLS_SKIP_VERIFY: bool = false;
 const DEFAULT_RUNTIME_FAILURE_THRESHOLD: usize = 3;
 const DEFAULT_COOLDOWN_SECONDS: u64 = 300;
@@ -93,70 +93,70 @@ impl AppConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config {}", path.display()))?;
+            .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
         let config: Self = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config {}", path.display()))?;
+            .with_context(|| format!("解析配置文件失败：{}", path.display()))?;
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.max_retries == 0 {
-            bail!("max_retries must be greater than 0");
+            bail!("max_retries 必须大于 0");
         }
         if self.connect_timeout_ms == 0 {
-            bail!("connect_timeout_ms must be greater than 0");
+            bail!("connect_timeout_ms 必须大于 0");
         }
         if self.subscription_timeout_ms == 0 {
-            bail!("subscription_timeout_ms must be greater than 0");
+            bail!("subscription_timeout_ms 必须大于 0");
         }
         if self.subscription_user_agent.trim().is_empty() {
-            bail!("subscription_user_agent must not be empty");
+            bail!("subscription_user_agent 不能为空");
         }
         if let Some(proxy) = &self.subscription_proxy {
             validate_subscription_proxy(proxy)?;
         }
         let health_url = Url::parse(&self.health_check_url)
-            .with_context(|| format!("invalid health_check_url {}", self.health_check_url))?;
+            .with_context(|| format!("health_check_url 无效：{}", self.health_check_url))?;
         if !matches!(health_url.scheme(), "http" | "https") {
-            bail!("health_check_url supports only http:// or https:// URLs");
+            bail!("health_check_url 只支持 http:// 或 https:// URL");
         }
         if health_url.host_str().is_none() {
-            bail!("health_check_url must include a host");
+            bail!("health_check_url 必须包含 host");
         }
         if self.health_check_attempts == 0 {
-            bail!("health_check_attempts must be greater than 0");
+            bail!("health_check_attempts 必须大于 0");
         }
         if self.health_check_timeout_ms == 0 {
-            bail!("health_check_timeout_ms must be greater than 0");
+            bail!("health_check_timeout_ms 必须大于 0");
         }
         if self.health_check_concurrency == 0 {
-            bail!("health_check_concurrency must be greater than 0");
+            bail!("health_check_concurrency 必须大于 0");
         }
         if self.runtime_failure_threshold == 0 {
-            bail!("runtime_failure_threshold must be greater than 0");
+            bail!("runtime_failure_threshold 必须大于 0");
         }
         if self.cooldown_seconds == 0 {
-            bail!("cooldown_seconds must be greater than 0");
+            bail!("cooldown_seconds 必须大于 0");
         }
         NaiveTime::parse_from_str(&self.daily_refresh_time, "%H:%M").with_context(|| {
             format!(
-                "daily_refresh_time must use HH:MM, got {}",
+                "daily_refresh_time 必须使用 HH:MM 格式，当前值为 {}",
                 self.daily_refresh_time
             )
         })?;
         if self.mihomo_enabled {
             if self.mihomo_work_dir.as_os_str().is_empty() {
-                bail!("mihomo_work_dir must not be empty when mihomo_enabled is true");
+                bail!("mihomo_enabled=true 时 mihomo_work_dir 不能为空");
             }
             if self.mihomo_log_level.trim().is_empty() {
-                bail!("mihomo_log_level must not be empty when mihomo_enabled is true");
+                bail!("mihomo_enabled=true 时 mihomo_log_level 不能为空");
             }
             if self.mihomo_startup_timeout_ms == 0 {
-                bail!("mihomo_startup_timeout_ms must be greater than 0");
+                bail!("mihomo_startup_timeout_ms 必须大于 0");
             }
             if self.mihomo_retire_grace_seconds == 0 {
-                bail!("mihomo_retire_grace_seconds must be greater than 0");
+                bail!("mihomo_retire_grace_seconds 必须大于 0");
             }
         }
         Ok(())
@@ -170,18 +170,17 @@ pub fn supported_subscription_proxy_scheme(scheme: &str) -> bool {
 fn validate_subscription_proxy(proxy: &str) -> Result<()> {
     let proxy = proxy.trim();
     if proxy.is_empty() {
-        bail!("subscription_proxy must not be empty when set");
+        bail!("subscription_proxy 设置后不能为空");
     }
-    let url =
-        Url::parse(proxy).with_context(|| format!("invalid subscription_proxy URL {proxy}"))?;
+    let url = Url::parse(proxy).with_context(|| format!("subscription_proxy URL 无效：{proxy}"))?;
     if !supported_subscription_proxy_scheme(url.scheme()) {
         bail!(
-            "subscription_proxy supports only these schemes: {}",
+            "subscription_proxy 只支持这些协议：{}",
             SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES.join(", ")
         );
     }
     if url.host_str().is_none() {
-        bail!("subscription_proxy must include a host");
+        bail!("subscription_proxy 必须包含 host");
     }
     Ok(())
 }

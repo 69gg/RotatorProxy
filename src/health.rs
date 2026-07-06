@@ -14,7 +14,7 @@ use rustls::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     task::{JoinHandle, JoinSet},
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
@@ -61,18 +61,18 @@ struct HealthCheckTarget {
 impl HealthCheckTarget {
     fn from_config(config: &AppConfig) -> Result<Self> {
         let url = Url::parse(&config.health_check_url)
-            .with_context(|| format!("invalid health_check_url {}", config.health_check_url))?;
+            .with_context(|| format!("health_check_url 无效：{}", config.health_check_url))?;
         let scheme = match url.scheme() {
             "http" => HealthCheckScheme::Http,
             "https" => HealthCheckScheme::Https,
-            _ => bail!("health_check_url supports only http:// or https:// URLs"),
+            _ => bail!("health_check_url 只支持 http:// 或 https:// URL"),
         };
         let host = url
             .host_str()
-            .ok_or_else(|| anyhow::anyhow!("health_check_url must include a host"))?;
+            .ok_or_else(|| anyhow::anyhow!("health_check_url 必须包含 host"))?;
         let port = url
             .port_or_known_default()
-            .ok_or_else(|| anyhow::anyhow!("health_check_url is missing a port"))?;
+            .ok_or_else(|| anyhow::anyhow!("health_check_url 缺少端口"))?;
 
         let mut path = url.path().to_owned();
         if path.is_empty() {
@@ -117,10 +117,10 @@ impl fmt::Debug for HealthCheckTls {
 impl HealthCheckTls {
     fn new(host: &str, skip_verify: bool) -> Result<Self> {
         let server_name = ServerName::try_from(host.to_owned())
-            .with_context(|| format!("invalid health_check_url TLS server name {host}"))?;
+            .with_context(|| format!("health_check_url 的 TLS server name 无效：{host}"))?;
         Ok(Self {
             connector: build_health_tls_connector(skip_verify)
-                .context("failed to build HTTPS health-check TLS connector")?,
+                .context("构建 HTTPS 测活 TLS 连接器失败")?,
             server_name,
         })
     }
@@ -170,12 +170,10 @@ fn build_health_tls_connector(skip_verify: bool) -> io::Result<TlsConnector> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let wants_verifier = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|err| io::Error::other(format!("rustls protocol setup failed: {err}")))?;
+        .map_err(|err| io::Error::other(format!("rustls 协议初始化失败：{err}")))?;
 
     let builder = if skip_verify {
-        warn!(
-            "health_check_tls_skip_verify=true: HTTPS health-check certificate verification is disabled"
-        );
+        warn!("health_check_tls_skip_verify=true：HTTPS 测活证书校验已关闭");
         wants_verifier
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureHealthCertVerifier))
@@ -194,7 +192,7 @@ pub async fn refresh_proxy_pool(
     mihomo: &MihomoManager,
     reason: &str,
 ) -> Result<RefreshSummary> {
-    info!(reason, "starting proxy source reload and health check");
+    info!(reason, "开始重新加载代理来源并执行健康检查");
     let loaded_set = load_proxies_from_dirs(config).await?;
     let loaded = loaded_set.total_len();
     info!(
@@ -202,7 +200,7 @@ pub async fn refresh_proxy_pool(
         loaded_nodes = loaded,
         native_nodes = loaded_set.native.len(),
         complex_nodes = loaded_set.mihomo.len(),
-        "loaded proxy nodes"
+        "代理节点加载完成"
     );
 
     let mut candidates = loaded_set.native;
@@ -214,7 +212,7 @@ pub async fn refresh_proxy_pool(
         reason,
         meow_nodes = meow_active_candidates,
         fallback_nodes = fallback_candidates,
-        "complex proxy native backend preparation completed"
+        "复杂代理原生后端准备完成"
     );
 
     let prepared_mihomo = match mihomo
@@ -223,7 +221,7 @@ pub async fn refresh_proxy_pool(
     {
         Ok(prepared) => prepared,
         Err(err) => {
-            warn!("failed to prepare mihomo nodes; complex nodes will be skipped: {err:#}");
+            warn!("Mihomo 节点准备失败，相关复杂节点将被跳过：{err:#}");
             None
         }
     };
@@ -237,7 +235,7 @@ pub async fn refresh_proxy_pool(
         warn!(
             reason,
             loaded_nodes = loaded,
-            "all configured proxy nodes failed health checks; pool will be empty"
+            "所有已配置代理节点健康检查均失败，活动代理池将为空"
         );
     }
 
@@ -248,7 +246,7 @@ pub async fn refresh_proxy_pool(
         loaded_nodes = loaded,
         active_nodes = active_len,
         rejected_nodes = loaded.saturating_sub(active_len),
-        "proxy refresh completed"
+        "代理刷新完成"
     );
 
     Ok(RefreshSummary {
@@ -284,7 +282,7 @@ async fn apply_mihomo_generation(
     } else {
         warn!(
             generation,
-            "all mihomo-backed nodes failed health checks; generation will not be activated"
+            "所有 Mihomo 承载节点健康检查均失败，本次 generation 不会激活"
         );
         mihomo.deactivate(retire_grace).await;
     }
@@ -299,7 +297,7 @@ pub fn spawn_daily_refresh(
         let refresh_time = match parse_daily_refresh_time(&config.daily_refresh_time) {
             Ok(refresh_time) => refresh_time,
             Err(err) => {
-                error!("daily refresh scheduler disabled: {err:#}");
+                error!("每日刷新调度已禁用：{err:#}");
                 return;
             }
         };
@@ -309,12 +307,12 @@ pub fn spawn_daily_refresh(
             info!(
                 daily_refresh_time = %config.daily_refresh_time,
                 wait_seconds = wait.as_secs(),
-                "next proxy refresh scheduled"
+                "下一次代理刷新已计划"
             );
             sleep(wait).await;
 
             if let Err(err) = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled").await {
-                error!("scheduled proxy refresh failed; keeping previous active pool: {err:#}");
+                error!("定时代理刷新失败，将继续使用上一版活动代理池：{err:#}");
             }
         }
     })
@@ -322,7 +320,7 @@ pub fn spawn_daily_refresh(
 
 pub fn parse_daily_refresh_time(value: &str) -> Result<NaiveTime> {
     NaiveTime::parse_from_str(value, "%H:%M")
-        .with_context(|| format!("daily_refresh_time must use HH:MM, got {value}"))
+        .with_context(|| format!("daily_refresh_time 必须使用 HH:MM 格式，当前值为 {value}"))
 }
 
 pub fn duration_until_next_refresh(refresh_time: NaiveTime) -> Duration {
@@ -358,14 +356,23 @@ async fn health_check_proxies(
     proxies: Vec<ProxyNode>,
 ) -> Result<Vec<ProxyNode>> {
     if proxies.is_empty() {
-        info!("no proxy nodes loaded; direct mode remains available");
+        info!("未加载到代理节点，将保持直连模式可用");
         return Ok(Vec::new());
     }
 
     let target = Arc::new(HealthCheckTarget::from_config(config)?);
     let attempts = config.health_check_attempts;
     let timeout = Duration::from_millis(config.health_check_timeout_ms);
-    let worker_count = config.health_check_concurrency.min(proxies.len()).max(1);
+    let total = proxies.len();
+    let worker_count = config.health_check_concurrency.min(total).max(1);
+    info!(
+        target = %target.display,
+        total_nodes = total,
+        attempts,
+        timeout_ms = config.health_check_timeout_ms,
+        concurrency = worker_count,
+        "批量健康检查开始"
+    );
     let queue = Arc::new(Mutex::new(proxies.into_iter()));
     let mut checks = JoinSet::new();
 
@@ -387,10 +394,10 @@ async fn health_check_proxies(
 
                 let label = proxy.label();
                 if check_proxy_node(&proxy, &target, attempts, timeout).await {
-                    debug!(node = %label, "proxy admitted to active pool");
+                    debug!(node = %label, "代理节点已加入活动代理池");
                     active.push(proxy);
                 } else {
-                    warn!(node = %label, "proxy rejected by health check");
+                    debug!(node = %label, "代理节点未通过健康检查");
                 }
             }
             active
@@ -401,10 +408,18 @@ async fn health_check_proxies(
     while let Some(result) = checks.join_next().await {
         match result {
             Ok(mut worker_active) => active.append(&mut worker_active),
-            Err(err) => warn!("health check task failed: {err}"),
+            Err(err) => warn!("健康检查任务失败：{err}"),
         }
     }
 
+    info!(
+        target = %target.display,
+        checked_nodes = total,
+        active_nodes = active.len(),
+        rejected_nodes = total.saturating_sub(active.len()),
+        concurrency = worker_count,
+        "批量健康检查完成"
+    );
     Ok(active)
 }
 
@@ -420,13 +435,13 @@ async fn check_proxy_node(
         match run_health_check(proxy, target, timeout).await {
             Ok(()) => {
                 if attempt == 1 {
-                    debug!(node = %label, target = %target.display, "proxy health check passed");
+                    debug!(node = %label, target = %target.display, "代理健康检查通过");
                 } else {
-                    info!(
+                    debug!(
                         node = %label,
                         target = %target.display,
                         attempt,
-                        "proxy health check passed after retry"
+                        "代理重试后健康检查通过"
                     );
                 }
                 return true;
@@ -436,26 +451,45 @@ async fn check_proxy_node(
                     node = %label,
                     target = %target.display,
                     attempt,
-                    "proxy health check failed: {err}"
+                    "代理健康检查失败：{err}"
                 );
                 last_error = Some(err);
             }
         }
     }
 
-    warn!(
+    debug!(
         node = %label,
         attempts,
-        "proxy health check failed all attempts: {}",
+        "代理健康检查全部尝试失败：{}",
         last_error
             .as_ref()
             .map(ToString::to_string)
-            .unwrap_or_else(|| "unknown error".to_owned())
+            .unwrap_or_else(|| "未知错误".to_owned())
     );
     false
 }
 
 async fn run_health_check(
+    proxy: &ProxyNode,
+    target: &HealthCheckTarget,
+    attempt_timeout: Duration,
+) -> io::Result<()> {
+    match timeout(
+        attempt_timeout,
+        run_health_check_inner(proxy, target, attempt_timeout),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("测活超时，耗时 {attempt_timeout:?}"),
+        )),
+    }
+}
+
+async fn run_health_check_inner(
     proxy: &ProxyNode,
     target: &HealthCheckTarget,
     timeout: Duration,
@@ -470,7 +504,7 @@ async fn run_health_check(
             let tls = target
                 .tls
                 .as_ref()
-                .ok_or_else(|| io::Error::other("HTTPS health-check TLS state is missing"))?;
+                .ok_or_else(|| io::Error::other("HTTPS 测活 TLS 状态缺失"))?;
             let mut tls_stream = tls
                 .connector
                 .connect(tls.server_name.clone(), stream)
@@ -482,9 +516,7 @@ async fn run_health_check(
     if (200..400).contains(&status) {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "health endpoint returned HTTP {status}"
-        )))
+        Err(io::Error::other(format!("测活端点返回 HTTP {status}")))
     }
 }
 
@@ -499,7 +531,7 @@ where
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "connection closed before health response header finished",
+                "连接在测活响应头读取完成前关闭",
             ));
         }
         header.push(byte[0]);
@@ -509,7 +541,7 @@ where
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "health response header exceeded limit",
+        "测活响应头超过大小限制",
     ))
 }
 
@@ -518,21 +550,21 @@ fn parse_http_status(header: &[u8]) -> io::Result<u16> {
     let status_line = text
         .lines()
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty health response"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "测活响应为空"))?;
     let mut parts = status_line.split_whitespace();
     let version = parts.next().unwrap_or_default();
     let status = parts
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing health status"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "测活响应缺少状态码"))?;
     if !version.starts_with("HTTP/") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid health response version",
+            "测活响应 HTTP 版本无效",
         ));
     }
     status
         .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid health status"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "测活响应状态码无效"))
 }
 
 #[cfg(test)]

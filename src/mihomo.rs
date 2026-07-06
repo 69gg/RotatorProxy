@@ -80,7 +80,7 @@ impl MihomoManager {
         if !config.mihomo_enabled {
             warn!(
                 nodes = proxies.len(),
-                "mihomo is disabled; skipping complex Clash-compatible nodes"
+                "Mihomo 未启用，将跳过这些复杂 Clash 兼容节点"
             );
             return Ok(None);
         }
@@ -93,27 +93,27 @@ impl MihomoManager {
             .join(format!("gen-{generation_id}"));
         tokio::fs::create_dir_all(&generation_dir)
             .await
-            .with_context(|| format!("failed to create {}", generation_dir.display()))?;
+            .with_context(|| format!("创建目录失败：{}", generation_dir.display()))?;
 
         let reserved_ports = reserve_local_ports(proxies.len())?;
         let ports = reserved_ports
             .iter()
             .map(|listener| listener.local_addr().map(|addr| addr.port()))
             .collect::<io::Result<Vec<_>>>()
-            .context("failed to inspect reserved mihomo listener ports")?;
+            .context("读取已预留的 Mihomo 监听端口失败")?;
         let generated =
             build_generation_config(generation_id, &proxies, &ports, &config.mihomo_log_level)?;
         let config_path = generation_dir.join("config.yaml");
         let yaml = serde_yaml::to_string(&generated.config)
-            .context("failed to serialize mihomo generation config")?;
+            .context("序列化 Mihomo generation 配置失败")?;
         tokio::fs::write(&config_path, yaml)
             .await
-            .with_context(|| format!("failed to write {}", config_path.display()))?;
+            .with_context(|| format!("写入配置失败：{}", config_path.display()))?;
         drop(reserved_ports);
 
         let mut child = spawn_mihomo(&binary, &config_path, &generation_dir, generation_id)
             .await
-            .with_context(|| format!("failed to start mihomo {}", binary.display()))?;
+            .with_context(|| format!("启动 Mihomo 失败：{}", binary.display()))?;
         wait_for_listeners(
             &mut child,
             &ports,
@@ -124,7 +124,7 @@ impl MihomoManager {
         info!(
             generation = generation_id,
             nodes = generated.nodes.len(),
-            "mihomo generation is ready"
+            "Mihomo generation 已准备就绪"
         );
         Ok(Some(MihomoPreparedGeneration {
             generation: MihomoGeneration {
@@ -147,7 +147,7 @@ impl MihomoManager {
         info!(
             generation = id,
             nodes = node_count,
-            "mihomo generation activated"
+            "Mihomo generation 已激活"
         );
         retire_old_generation(old, retire_grace);
     }
@@ -199,7 +199,7 @@ fn build_generation_config(
     log_level: &str,
 ) -> Result<GeneratedMihomoConfig> {
     if proxies.len() != ports.len() {
-        bail!("mihomo proxy count and listener port count differ");
+        bail!("Mihomo 代理数量和监听端口数量不一致");
     }
 
     let mut proxy_values = Vec::with_capacity(proxies.len());
@@ -210,7 +210,7 @@ fn build_generation_config(
         let internal_name = format!("rp-{generation_id}-{index}");
         let mut proxy_mapping = match proxy.value.clone() {
             serde_yaml::Value::Mapping(mapping) => mapping,
-            _ => bail!("mihomo proxy {} is not a YAML mapping", proxy.name),
+            _ => bail!("Mihomo 代理 {} 不是 YAML mapping", proxy.name),
         };
         proxy_mapping.insert(
             serde_yaml::Value::String("name".to_owned()),
@@ -270,7 +270,7 @@ fn insert_yaml(
 ) -> Result<()> {
     mapping.insert(
         serde_yaml::Value::String(key.to_owned()),
-        serde_yaml::to_value(value).context("failed to serialize mihomo YAML value")?,
+        serde_yaml::to_value(value).context("序列化 Mihomo YAML 值失败")?,
     );
     Ok(())
 }
@@ -325,7 +325,7 @@ where
                     warn!(
                         generation = generation_id,
                         stream = stream_name,
-                        "failed to read mihomo output: {err}"
+                        "读取 Mihomo 输出失败：{err}"
                     );
                     break;
                 }
@@ -341,8 +341,8 @@ async fn wait_for_listeners(
 ) -> Result<()> {
     let start = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().context("failed to poll mihomo process")? {
-            bail!("mihomo exited before listeners became ready: {status}");
+        if let Some(status) = child.try_wait().context("检查 Mihomo 进程状态失败")? {
+            bail!("Mihomo 在监听器就绪前退出：{status}");
         }
 
         let mut ready = true;
@@ -362,7 +362,7 @@ async fn wait_for_listeners(
             return Ok(());
         }
         if start.elapsed() >= startup_timeout {
-            bail!("mihomo listeners were not ready within {startup_timeout:?}");
+            bail!("Mihomo 监听器在 {startup_timeout:?} 内未就绪");
         }
         sleep(MIHOMO_STARTUP_PROBE_INTERVAL).await;
     }
@@ -371,8 +371,8 @@ async fn wait_for_listeners(
 fn reserve_local_ports(count: usize) -> Result<Vec<StdTcpListener>> {
     let mut listeners = Vec::with_capacity(count);
     for _ in 0..count {
-        let listener = StdTcpListener::bind((LOCAL_LISTEN_HOST, 0))
-            .context("failed to reserve local mihomo listener port")?;
+        let listener =
+            StdTcpListener::bind((LOCAL_LISTEN_HOST, 0)).context("预留本地 Mihomo 监听端口失败")?;
         listeners.push(listener);
     }
     Ok(listeners)
@@ -383,10 +383,7 @@ async fn ensure_mihomo_binary(config: &AppConfig) -> Result<PathBuf> {
         if path.is_file() {
             return Ok(path.clone());
         }
-        bail!(
-            "configured mihomo_binary does not exist: {}",
-            path.display()
-        );
+        bail!("配置的 mihomo_binary 不存在：{}", path.display());
     }
 
     if let Some(path) = find_binary_in_path(&["mihomo", "clash-meta", "clash"]) {
@@ -394,7 +391,7 @@ async fn ensure_mihomo_binary(config: &AppConfig) -> Result<PathBuf> {
     }
 
     if !config.mihomo_auto_download {
-        bail!("mihomo binary not found in PATH and mihomo_auto_download is false");
+        bail!("PATH 中未找到 Mihomo 二进制文件，且 mihomo_auto_download=false");
     }
 
     download_linux_mihomo(config).await
@@ -416,21 +413,21 @@ fn find_binary_in_path(names: &[&str]) -> Option<PathBuf> {
 async fn download_linux_mihomo(config: &AppConfig) -> Result<PathBuf> {
     let arch = linux_mihomo_arch()?;
     let client = build_subscription_client(&SubscriptionOptions::from(config))
-        .context("failed to build mihomo download HTTP client")?;
+        .context("构建 Mihomo 下载 HTTP 客户端失败")?;
     let release_body = client
         .get(GITHUB_LATEST_RELEASE_URL)
         .send()
         .await
-        .context("failed to query latest mihomo release")?
+        .context("查询最新 Mihomo release 失败")?
         .error_for_status()
-        .context("mihomo release API returned non-success status")?
+        .context("Mihomo release API 返回非成功状态")?
         .text()
         .await
-        .context("failed to read mihomo release response")?;
+        .context("读取 Mihomo release 响应失败")?;
     let release: GithubRelease =
-        serde_json::from_str(&release_body).context("failed to parse mihomo release response")?;
+        serde_json::from_str(&release_body).context("解析 Mihomo release 响应失败")?;
     let asset = select_linux_asset(&release, arch)
-        .ok_or_else(|| anyhow!("latest mihomo release has no linux {arch} gzip asset"))?;
+        .ok_or_else(|| anyhow!("最新 Mihomo release 没有 linux {arch} gzip 资源"))?;
     let safe_tag = release.tag_name.replace('/', "_");
     let binary_path = config
         .mihomo_work_dir
@@ -444,29 +441,29 @@ async fn download_linux_mihomo(config: &AppConfig) -> Result<PathBuf> {
         tag = %release.tag_name,
         asset = %asset.name,
         path = %binary_path.display(),
-        "downloading mihomo binary"
+        "正在下载 Mihomo 二进制文件"
     );
     let bytes = client
         .get(&asset.browser_download_url)
         .send()
         .await
-        .with_context(|| format!("failed to download {}", asset.browser_download_url))?
+        .with_context(|| format!("下载失败：{}", asset.browser_download_url))?
         .error_for_status()
-        .context("mihomo binary download returned non-success status")?
+        .context("Mihomo 二进制下载返回非成功状态")?
         .bytes()
         .await
-        .context("failed to read mihomo binary download")?;
+        .context("读取 Mihomo 二进制下载内容失败")?;
 
     let parent = binary_path
         .parent()
-        .ok_or_else(|| anyhow!("invalid mihomo binary path {}", binary_path.display()))?;
+        .ok_or_else(|| anyhow!("Mihomo 二进制路径无效：{}", binary_path.display()))?;
     tokio::fs::create_dir_all(parent)
         .await
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+        .with_context(|| format!("创建目录失败：{}", parent.display()))?;
     let output_path = binary_path.clone();
     tokio::task::spawn_blocking(move || decompress_gzip_to_executable(&bytes, &output_path))
         .await
-        .context("mihomo binary decompression task failed")??;
+        .context("Mihomo 二进制解压任务失败")??;
     Ok(binary_path)
 }
 
@@ -474,10 +471,8 @@ fn linux_mihomo_arch() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok("amd64"),
         ("linux", "aarch64") => Ok("arm64"),
-        ("linux", other) => bail!("automatic mihomo download does not support linux {other}"),
-        (os, arch) => bail!(
-            "automatic mihomo download currently supports linux amd64/arm64 only; got {os}/{arch}"
-        ),
+        ("linux", other) => bail!("Mihomo 自动下载不支持 linux {other}"),
+        (os, arch) => bail!("Mihomo 自动下载目前仅支持 linux amd64/arm64，当前为 {os}/{arch}"),
     }
 }
 
@@ -485,8 +480,8 @@ fn decompress_gzip_to_executable(bytes: &[u8], output_path: &Path) -> Result<()>
     let temp_path = output_path.with_extension("tmp");
     let mut decoder = GzDecoder::new(bytes);
     let mut output = File::create(&temp_path)
-        .with_context(|| format!("failed to create {}", temp_path.display()))?;
-    io::copy(&mut decoder, &mut output).context("failed to decompress mihomo gzip asset")?;
+        .with_context(|| format!("创建文件失败：{}", temp_path.display()))?;
+    io::copy(&mut decoder, &mut output).context("解压 Mihomo gzip 资源失败")?;
 
     #[cfg(unix)]
     {
@@ -494,17 +489,17 @@ fn decompress_gzip_to_executable(bytes: &[u8], output_path: &Path) -> Result<()>
 
         let mut permissions = output
             .metadata()
-            .context("failed to read decompressed mihomo metadata")?
+            .context("读取已解压 Mihomo 文件元数据失败")?
             .permissions();
         permissions.set_mode(0o755);
         output
             .set_permissions(permissions)
-            .context("failed to chmod mihomo binary")?;
+            .context("设置 Mihomo 二进制权限失败")?;
     }
     drop(output);
     std::fs::rename(&temp_path, output_path).with_context(|| {
         format!(
-            "failed to move {} to {}",
+            "移动文件失败：{} -> {}",
             temp_path.display(),
             output_path.display()
         )
@@ -551,7 +546,7 @@ fn retire_old_generation(generation: Option<MihomoGeneration>, retire_grace: Dur
         info!(
             generation = id,
             grace_seconds = retire_grace.as_secs(),
-            "mihomo generation scheduled for retirement"
+            "Mihomo generation 已计划延迟退出"
         );
         sleep(retire_grace).await;
         retire_generation_now(generation).await;
@@ -561,18 +556,15 @@ fn retire_old_generation(generation: Option<MihomoGeneration>, retire_grace: Dur
 async fn retire_generation_now(mut generation: MihomoGeneration) {
     let id = generation.id;
     match generation.child.try_wait() {
-        Ok(Some(status)) => debug!(generation = id, %status, "mihomo generation already exited"),
+        Ok(Some(status)) => debug!(generation = id, %status, "Mihomo generation 已经退出"),
         Ok(None) => {
             if let Err(err) = generation.child.kill().await {
-                warn!(generation = id, "failed to kill mihomo generation: {err}");
+                warn!(generation = id, "终止 Mihomo generation 失败：{err}");
             }
             let _ = generation.child.wait().await;
-            info!(generation = id, "mihomo generation retired");
+            info!(generation = id, "Mihomo generation 已退出");
         }
-        Err(err) => warn!(
-            generation = id,
-            "failed to inspect mihomo generation: {err}"
-        ),
+        Err(err) => warn!(generation = id, "检查 Mihomo generation 状态失败：{err}"),
     }
     if let Err(err) = tokio::fs::remove_dir_all(&generation.work_dir).await
         && err.kind() != io::ErrorKind::NotFound
@@ -580,7 +572,7 @@ async fn retire_generation_now(mut generation: MihomoGeneration) {
         warn!(
             generation = id,
             path = %generation.work_dir.display(),
-            "failed to remove mihomo generation directory: {err}"
+            "删除 Mihomo generation 目录失败：{err}"
         );
     }
 }

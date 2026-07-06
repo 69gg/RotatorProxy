@@ -21,12 +21,12 @@ async fn main() -> Result<()> {
         Duration::from_secs(config.cooldown_seconds),
     );
     let mihomo = MihomoManager::new();
-    info!("startup proxy refresh begins before service starts");
+    info!("启动阶段开始刷新代理，完成前暂不提供服务");
     let summary = health::refresh_proxy_pool(&config, &pool, &mihomo, "startup").await?;
     info!(
         loaded_nodes = summary.loaded,
         active_nodes = summary.active,
-        "startup proxy refresh finished; starting service"
+        "启动阶段代理刷新完成，开始提供服务"
     );
 
     let connector = Connector::new(
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     let _refresh_handle = health::spawn_daily_refresh(config.clone(), pool, mihomo);
     server::run(&config.listen, connector)
         .await
-        .with_context(|| format!("proxy server failed on {}", config.listen))
+        .with_context(|| format!("代理服务在 {} 上运行失败", config.listen))
 }
 
 fn init_logging(level: &str) -> Result<()> {

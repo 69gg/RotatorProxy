@@ -20,7 +20,7 @@ pub async fn run_listener(listener: TcpListener, connector: Connector) -> io::Re
     let local_addr = listener.local_addr()?;
     let connector = Arc::new(connector);
     info!(
-        "RotatorProxy listening on {local_addr}, loaded {} proxies",
+        "RotatorProxy 正在监听 {local_addr}，已加载 {} 个代理",
         connector.proxy_count()
     );
 
@@ -29,7 +29,7 @@ pub async fn run_listener(listener: TcpListener, connector: Connector) -> io::Re
         let connector = Arc::clone(&connector);
         tokio::spawn(async move {
             if let Err(err) = handle_client(socket, connector).await {
-                debug!("client {peer} finished with error: {err}");
+                debug!("客户端 {peer} 处理结束并返回错误：{err}");
             }
         });
     }
@@ -78,7 +78,7 @@ async fn handle_http(mut client: TcpStream, connector: Arc<Connector>) -> io::Re
     let (client_to_remote, remote_to_client) =
         copy_bidirectional(&mut client, remote.as_mut()).await?;
     debug!(
-        "tunnel {} closed: client_to_remote={} remote_to_client={}",
+        "HTTP 隧道 {} 已关闭：client_to_remote={} remote_to_client={}",
         parsed.target, client_to_remote, remote_to_client
     );
     Ok(())
@@ -93,7 +93,7 @@ async fn read_http_request(client: &mut TcpStream) -> io::Result<Vec<u8>> {
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "connection closed before HTTP request header finished",
+                "连接在 HTTP 请求头读取完成前关闭",
             ));
         }
         buffer.extend_from_slice(&chunk[..n]);
@@ -103,34 +103,33 @@ async fn read_http_request(client: &mut TcpStream) -> io::Result<Vec<u8>> {
         if buffer.len() > HTTP_REQUEST_HEADER_LIMIT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "HTTP request header exceeded limit",
+                "HTTP 请求头超过大小限制",
             ));
         }
     }
 }
 
 fn parse_http_request(buffer: &[u8]) -> io::Result<ParsedHttpRequest> {
-    let header_end = find_header_end(buffer).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing HTTP header terminator")
-    })?;
+    let header_end = find_header_end(buffer)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "缺少 HTTP 头结束标记"))?;
     let header_bytes = &buffer[..header_end];
     let extra = &buffer[header_end..];
     let header_text = str::from_utf8(header_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP header is not UTF-8"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP 头不是 UTF-8"))?;
     let mut lines = header_text.split("\r\n");
     let request_line = lines
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP request line"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "缺少 HTTP 请求行"))?;
     let mut parts = request_line.split_whitespace();
     let method = parts
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP method"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "缺少 HTTP method"))?;
     let request_target = parts
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP request target"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "缺少 HTTP request target"))?;
     let version = parts
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP version"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "缺少 HTTP version"))?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let target = TargetAddr::parse(request_target, None)
@@ -171,13 +170,13 @@ fn target_from_http_request_target(
     if request_target.starts_with("http://") || request_target.starts_with("https://") {
         let url = Url::parse(request_target)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let host = url.host_str().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "absolute URI missing host")
-        })?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "absolute URI 缺少 host"))?;
         let port = url.port_or_known_default().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "absolute URI scheme does not have a known default port",
+                "absolute URI 协议没有已知默认端口",
             )
         })?;
         let mut origin = url.path().to_owned();
@@ -196,10 +195,7 @@ fn target_from_http_request_target(
     }
 
     let host = find_header(headers, "host").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "origin-form request missing Host header",
-        )
+        io::Error::new(io::ErrorKind::InvalidData, "origin-form 请求缺少 Host 头")
     })?;
     let target = TargetAddr::parse(host, Some(80))
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -245,7 +241,7 @@ async fn handle_socks5(mut client: TcpStream, connector: Arc<Connector>) -> io::
     if head[0] != 0x05 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid SOCKS5 version",
+            "SOCKS5 版本无效",
         ));
     }
 
@@ -253,9 +249,7 @@ async fn handle_socks5(mut client: TcpStream, connector: Arc<Connector>) -> io::
     client.read_exact(&mut methods).await?;
     if !methods.contains(&0x00) {
         client.write_all(&[0x05, 0xff]).await?;
-        return Err(io::Error::other(
-            "SOCKS5 client did not offer no-auth method",
-        ));
+        return Err(io::Error::other("SOCKS5 客户端未提供免认证方法"));
     }
     client.write_all(&[0x05, 0x00]).await?;
 
@@ -271,7 +265,7 @@ async fn handle_socks5(mut client: TcpStream, connector: Arc<Connector>) -> io::
         write_socks5_reply(&mut client, 0x07).await?;
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "SOCKS5 command is not CONNECT",
+            "SOCKS5 命令不是 CONNECT",
         ));
     }
 
@@ -287,7 +281,7 @@ async fn handle_socks5(mut client: TcpStream, connector: Arc<Connector>) -> io::
     let (client_to_remote, remote_to_client) =
         copy_bidirectional(&mut client, remote.as_mut()).await?;
     debug!(
-        "SOCKS5 tunnel {} closed: client_to_remote={} remote_to_client={}",
+        "SOCKS5 隧道 {} 已关闭：client_to_remote={} remote_to_client={}",
         request.target, client_to_remote, remote_to_client
     );
     Ok(())
@@ -299,7 +293,7 @@ async fn read_socks5_request(client: &mut TcpStream) -> io::Result<Socks5Request
     if head[0] != 0x05 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid SOCKS5 request version",
+            "SOCKS5 请求版本无效",
         ));
     }
     let command = head[1];
@@ -319,9 +313,8 @@ async fn read_socks5_request(client: &mut TcpStream) -> io::Result<Socks5Request
             client.read_exact(&mut domain).await?;
             let mut port = [0_u8; 2];
             client.read_exact(&mut port).await?;
-            let host = String::from_utf8(domain).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "SOCKS5 domain is not UTF-8")
-            })?;
+            let host = String::from_utf8(domain)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SOCKS5 域名不是 UTF-8"))?;
             TargetAddr::new(host, u16::from_be_bytes(port))
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
         }
@@ -337,7 +330,7 @@ async fn read_socks5_request(client: &mut TcpStream) -> io::Result<Socks5Request
         atyp => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported SOCKS5 address type {atyp:#x}"),
+                format!("不支持的 SOCKS5 地址类型 {atyp:#x}"),
             ));
         }
     };

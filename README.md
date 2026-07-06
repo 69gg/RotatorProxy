@@ -43,7 +43,7 @@ cargo run --release -- --config config.toml
 - `log_level`：默认日志级别。`RUST_LOG` 会覆盖该值。
 - `health_check_url`：用于节点测活的 HTTP 或 HTTPS URL。返回任意 2xx/3xx 状态码即认为健康。
 - `health_check_attempts`：节点被排除出活动代理池前的测活尝试次数。
-- `health_check_concurrency`：批量测活时的最大并发数。
+- `health_check_concurrency`：批量测活时的最大并发数。节点很多时建议设置为 `128` 到 `512`。
 - `health_check_tls_skip_verify`：显式设为 `true` 时跳过 HTTPS 测活证书校验，默认 `false`。
 - `runtime_failure_threshold`：活动节点运行时连接失败多少次后进入冷却。
 - `cooldown_seconds`：运行时故障节点被跳过的冷却时长。
@@ -118,7 +118,7 @@ proxies:
 
 ## Clash 兼容节点
 
-RotatorProxy 在进程内处理常见 TCP 代理协议。简单协议使用本地实现：HTTP、SOCKS4/5 和普通 Shadowsocks。复杂 Clash 兼容节点会优先交给内嵌 `meow-proxy` 后端构建。目前该路径覆盖 VMess、VLESS、Trojan、Hysteria2/Hy2、Snell、AnyTLS、Reality TLS、uTLS/client-fingerprint 配置，以及带受支持内置插件的 Shadowsocks。
+RotatorProxy 在进程内处理常见 TCP 代理协议。简单协议使用本地实现：HTTP、HTTPS、SOCKS4/5 和普通 Shadowsocks。复杂 Clash 兼容节点会优先交给内嵌 `meow-proxy` 后端构建。目前该路径覆盖 VMess、VLESS、Trojan、Hysteria2/Hy2、Snell、AnyTLS、Reality TLS、uTLS/client-fingerprint 配置，以及带受支持内置插件的 Shadowsocks。
 
 Reality 和真实 uTLS/client-fingerprint 支持使用 `meow-transport` 的 BoringSSL TLS 路径，仍在 Rust 进程内完成。此类节点不需要外部 Mihomo 二进制，但 Linux 构建需要 `boring-sys` 所需的常规原生工具链。
 
@@ -136,11 +136,11 @@ RotatorProxy 不会监控输入目录变化。它只会在启动时和配置的�
 
 对于 Mihomo-backed fallback 节点，新 sidecar generation 会在测活前启动。如果其中至少一个节点测活通过，该 generation 会被激活，旧 generation 会在 `mihomo_retire_grace_seconds` 后退出。如果没有节点通过，新 generation 会被丢弃，失败节点不会进入轮换。
 
-日志会覆盖来源加载、订阅获取失败、健康检查准入/拒绝、代理池切换、运行时失败和冷却状态变化。
+日志会覆盖来源加载、订阅获取失败、解析异常汇总、健康检查开始/完成总结、代理池切换、运行时失败和冷却状态变化。RotatorProxy 自身日志使用中文；依赖库或可选 Mihomo sidecar 的日志会按其原始内容输出。逐行解析失败明细默认在 debug 日志中输出，避免大型公开源刷屏。
 
 ## 当前范围
 
-RotatorProxy 是 TCP 代理轮换器。它不在自身进程中实现 UDP associate，也不实现 Clash 规则引擎。复杂 TCP 协议会在受支持时由内嵌后端处理；只有 fallback 才能支持的 Clash 协议需要显式启用 Mihomo。未知的非 Clash 行格式会记录警告并跳过。
+RotatorProxy 是 TCP 代理轮换器。它不在自身进程中实现 UDP associate，也不实现 Clash 规则引擎。复杂 TCP 协议会在受支持时由内嵌后端处理；只有 fallback 才能支持的 Clash 协议需要显式启用 Mihomo。未知的非 Clash 行格式会计入来源解析汇总并跳过，打开 debug 日志可以查看具体行号。
 
 健康检查支持 `http://` 和 `https://` URL。
 
@@ -162,7 +162,8 @@ cargo test
 - 第一个出站代理失败时重试下一个代理。
 - 批量健康刷新过滤失败代理并切换活动代理池。
 - HTTPS 健康检查显式跳过证书校验。
-- 原生 Clash 节点、复杂 Clash 节点和常见复杂 URI 链接的解析覆盖。
+- 原生 Clash 节点、复杂 Clash 节点、HTTPS 代理和常见复杂 URI 链接的解析覆盖。
+- HTTPS 出站代理可参与批量健康检查。
 - 不启动真实 Mihomo 进程的 generation 配置渲染。
 
 ## 许可证
