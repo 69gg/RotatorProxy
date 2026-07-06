@@ -1,4 +1,4 @@
-use std::{fs, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashSet, fs, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rotator_proxy::{
@@ -358,6 +358,45 @@ async fn retries_next_proxy_when_first_proxy_fails() -> io::Result<()> {
 }
 
 #[tokio::test]
+async fn zero_retries_can_try_entire_pool_until_success() -> io::Result<()> {
+    let bad_port_a = unused_local_port().await?;
+    let bad_port_b = unused_local_port().await?;
+    let (target_addr, _target_handle) = spawn_echo_server().await?;
+    let (good_proxy_addr, _good_proxy_handle) = spawn_http_connect_proxy().await?;
+
+    let proxies = vec![
+        ProxyNode::Http {
+            addr: HostPort::new("127.0.0.1", bad_port_a).unwrap(),
+            auth: None,
+        },
+        ProxyNode::Http {
+            addr: HostPort::new("127.0.0.1", bad_port_b).unwrap(),
+            auth: None,
+        },
+        ProxyNode::Http {
+            addr: HostPort::new("127.0.0.1", good_proxy_addr.port()).unwrap(),
+            auth: None,
+        },
+    ];
+    let connector = Connector::new(ProxyPool::new(proxies, 0), Duration::from_millis(500));
+    let (proxy_addr, proxy_handle) = spawn_rotator(connector).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    let request = format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n");
+    client.write_all(request.as_bytes()).await?;
+    let response = read_header(&mut client).await?;
+    assert!(String::from_utf8_lossy(&response).contains("200 Connection Established"));
+
+    client.write_all(b"full").await?;
+    let mut echoed = [0_u8; 4];
+    client.read_exact(&mut echoed).await?;
+    assert_eq!(&echoed, b"full");
+
+    proxy_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_refresh_filters_failed_proxy_and_swaps_pool() -> io::Result<()> {
     let bad_port = unused_local_port().await?;
     let (target_addr, _first_line_rx, _target_handle) = spawn_http_target().await?;
@@ -432,13 +471,10 @@ async fn disabled_health_precheck_loads_all_candidates() -> io::Result<()> {
 
     assert_eq!(summary.loaded, 2);
     assert_eq!(summary.active, 2);
-    assert_eq!(
-        labels_from_pool(&pool),
-        vec![
-            format!("http://127.0.0.1:{bad_port}"),
-            format!("http://127.0.0.1:{good_port}")
-        ]
-    );
+    let labels: HashSet<String> = labels_from_pool(&pool).into_iter().collect();
+    assert_eq!(labels.len(), 2);
+    assert!(labels.contains(&format!("http://127.0.0.1:{bad_port}")));
+    assert!(labels.contains(&format!("http://127.0.0.1:{good_port}")));
     Ok(())
 }
 

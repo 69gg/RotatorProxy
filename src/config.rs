@@ -115,9 +115,6 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.max_retries == 0 {
-            bail!("max_retries 必须大于 0");
-        }
         if self.connect_timeout_ms == 0 {
             bail!("connect_timeout_ms 必须大于 0");
         }
@@ -328,12 +325,12 @@ proxy_dirs = ["./fixtures"]
     }
 
     #[test]
-    fn rejects_zero_retries() {
+    fn accepts_zero_retries_as_full_pool_attempts() {
         let config = AppConfig {
             max_retries: 0,
             ..AppConfig::default()
         };
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

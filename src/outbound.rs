@@ -57,10 +57,10 @@ impl Connector {
     }
 
     pub async fn connect(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
-        let candidates = self.pool.candidates();
+        let mut attempts = self.pool.attempts();
         let mut last_error = None;
 
-        for choice in candidates {
+        for choice in &mut attempts {
             let label = choice.label();
             let attempt = timeout(self.connect_timeout, self.connect_once(&choice, target)).await;
             match attempt {

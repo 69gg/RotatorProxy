@@ -14,6 +14,7 @@ meow-common = "0.16.0"
 meow-proxy = { version = "0.16.0", default-features = false, features = ["ss", "trojan", "vless", "vless-vision", "vmess", "snell", "hysteria2", "anytls"] }
 meow-transport = { version = "0.16.0", features = ["tls", "boring-tls", "ws", "grpc", "h2", "httpupgrade"] }
 percent-encoding = "2.3.1"
+rand = "0.10"
 reqwest = { version = "0.13.4", features = ["socks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.217", features = ["derive"] }

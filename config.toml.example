@@ -11,7 +11,8 @@ listen = "127.0.0.1:7890"
 proxy_dirs = ["./proxies"]
 
 # Maximum outbound proxies to try for one inbound request when connection setup fails.
-# If no proxies are loaded, RotatorProxy connects directly.
+# Set to 0 to try every currently available proxy once. If no proxies are
+# loaded, RotatorProxy connects directly.
 max_retries = 10
 
 # Timeout for connecting to a target or outbound proxy.

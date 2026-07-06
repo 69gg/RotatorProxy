@@ -1,17 +1,15 @@
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fmt,
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow, bail};
 use meow_common::ProxyAdapter;
+use rand::seq::SliceRandom;
 use shadowsocks::{ServerConfig, relay::socks5::Address as ShadowAddress};
 use tracing::{debug, info, warn};
 
@@ -288,8 +286,8 @@ pub struct ProxyPool {
 
 #[derive(Debug)]
 struct ProxyPoolInner {
-    proxies: RwLock<Arc<Vec<Arc<ProxyEntry>>>>,
-    next: AtomicUsize,
+    state: RwLock<PoolState>,
+    selection: Mutex<SelectionBag>,
     max_retries: usize,
     runtime_failure_threshold: usize,
     runtime_disable_after_cooldowns: usize,
@@ -303,6 +301,39 @@ struct FailureRecord {
     cooldowns: usize,
     cooldown_until: Option<Instant>,
     disabled_until_refresh: bool,
+}
+
+#[derive(Debug)]
+struct PoolState {
+    proxies: Arc<Vec<Arc<ProxyEntry>>>,
+    generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct SelectionBag {
+    generation: u64,
+    remaining: Vec<usize>,
+}
+
+impl SelectionBag {
+    fn reset(&mut self, generation: u64) {
+        self.generation = generation;
+        self.remaining.clear();
+    }
+
+    fn next_index(&mut self, generation: u64, len: usize) -> Option<(usize, bool)> {
+        if len == 0 {
+            return None;
+        }
+        let mut refilled = false;
+        if self.generation != generation || self.remaining.is_empty() {
+            self.generation = generation;
+            self.remaining = (0..len).collect();
+            self.remaining.shuffle(&mut rand::rng());
+            refilled = true;
+        }
+        self.remaining.pop().map(|index| (index, refilled))
+    }
 }
 
 impl ProxyPool {
@@ -334,9 +365,12 @@ impl ProxyPool {
     ) -> Self {
         Self {
             inner: Arc::new(ProxyPoolInner {
-                proxies: RwLock::new(Arc::new(entries_from_nodes(proxies))),
-                next: AtomicUsize::new(0),
-                max_retries: max_retries.max(1),
+                state: RwLock::new(PoolState {
+                    proxies: Arc::new(entries_from_nodes(proxies)),
+                    generation: 0,
+                }),
+                selection: Mutex::new(SelectionBag::default()),
+                max_retries,
                 runtime_failure_threshold: runtime_failure_threshold.max(1),
                 runtime_disable_after_cooldowns: runtime_disable_after_cooldowns.max(1),
                 cooldown,
@@ -358,42 +392,50 @@ impl ProxyPool {
     pub fn replace(&self, proxies: Vec<ProxyNode>) {
         let entries = entries_from_nodes(proxies);
         let new_len = entries.len();
+        let generation = {
+            let mut guard = self.inner.state.write().expect("proxy pool lock poisoned");
+            guard.proxies = Arc::new(entries);
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.generation
+        };
         {
-            let mut guard = self
+            let mut selection = self
                 .inner
-                .proxies
-                .write()
-                .expect("proxy pool lock poisoned");
-            *guard = Arc::new(entries);
+                .selection
+                .lock()
+                .expect("proxy selection lock poisoned");
+            selection.reset(generation);
         }
         self.clear_failure_records();
         info!("活动代理池已切换，active_nodes={new_len}");
     }
 
+    pub fn attempts(&self) -> ProxyAttempts {
+        let len = self.len();
+        if len == 0 {
+            return ProxyAttempts {
+                pool: self.clone(),
+                tried: HashSet::new(),
+                remaining: 1,
+                direct_pending: true,
+            };
+        }
+
+        let remaining = if self.inner.max_retries == 0 {
+            len
+        } else {
+            self.inner.max_retries.min(len)
+        };
+        ProxyAttempts {
+            pool: self.clone(),
+            tried: HashSet::with_capacity(remaining),
+            remaining,
+            direct_pending: false,
+        }
+    }
+
     pub fn candidates(&self) -> Vec<ProxyChoice> {
-        let proxies = self.snapshot();
-        if proxies.is_empty() {
-            return vec![ProxyChoice::Direct];
-        }
-
-        let len = proxies.len();
-        let start = self.inner.next.fetch_add(1, Ordering::Relaxed) % len;
-        let limit = self.inner.max_retries.min(len);
-        let now = Instant::now();
-        let mut choices = Vec::with_capacity(limit);
-
-        for offset in 0..len {
-            if choices.len() == limit {
-                break;
-            }
-            let entry = Arc::clone(&proxies[(start + offset) % len]);
-            if self.is_unavailable(&entry, now) {
-                continue;
-            }
-            choices.push(ProxyChoice::Proxy(entry));
-        }
-
-        choices
+        self.attempts().collect()
     }
 
     pub fn report_success(&self, choice: &ProxyChoice) {
@@ -470,10 +512,42 @@ impl ProxyPool {
 
     fn snapshot(&self) -> Arc<Vec<Arc<ProxyEntry>>> {
         self.inner
-            .proxies
+            .state
             .read()
             .expect("proxy pool lock poisoned")
+            .proxies
             .clone()
+    }
+
+    fn next_random_available(&self, tried: &HashSet<String>) -> Option<Arc<ProxyEntry>> {
+        let now = Instant::now();
+        let state = self.inner.state.read().expect("proxy pool lock poisoned");
+        let len = state.proxies.len();
+        if len == 0 {
+            return None;
+        }
+
+        let mut selection = self
+            .inner
+            .selection
+            .lock()
+            .expect("proxy selection lock poisoned");
+        let mut scanned_in_round = 0;
+        loop {
+            let (index, refilled) = selection.next_index(state.generation, len)?;
+            if refilled {
+                scanned_in_round = 0;
+            }
+            scanned_in_round += 1;
+            let entry = Arc::clone(&state.proxies[index]);
+            if tried.contains(&entry.key) || self.is_unavailable(&entry, now) {
+                if scanned_in_round >= len {
+                    return None;
+                }
+                continue;
+            }
+            return Some(entry);
+        }
     }
 
     fn failure_shard(
@@ -512,6 +586,34 @@ impl ProxyPool {
             let mut failures = shard.lock().expect("proxy failure lock poisoned");
             failures.clear();
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct ProxyAttempts {
+    pool: ProxyPool,
+    tried: HashSet<String>,
+    remaining: usize,
+    direct_pending: bool,
+}
+
+impl Iterator for ProxyAttempts {
+    type Item = ProxyChoice;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.direct_pending {
+            self.direct_pending = false;
+            self.remaining = 0;
+            return Some(ProxyChoice::Direct);
+        }
+
+        if self.remaining == 0 {
+            return None;
+        }
+        let entry = self.pool.next_random_available(&self.tried)?;
+        self.tried.insert(entry.key.clone());
+        self.remaining -= 1;
+        Some(ProxyChoice::Proxy(entry))
     }
 }
 
@@ -562,27 +664,55 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_round_robin() {
+    fn candidates_use_random_bag_without_replacement() {
+        let pool = ProxyPool::new(vec![http_proxy(1), http_proxy(2), http_proxy(3)], 1);
+        let labels: HashSet<String> = (0..3)
+            .map(|_| {
+                pool.candidates()
+                    .into_iter()
+                    .next()
+                    .expect("one candidate should be available")
+                    .label()
+            })
+            .collect();
+        assert_eq!(labels.len(), 3);
+        assert!(labels.contains("http://127.0.0.1:1"));
+        assert!(labels.contains("http://127.0.0.1:2"));
+        assert!(labels.contains("http://127.0.0.1:3"));
+
+        let label = pool
+            .candidates()
+            .into_iter()
+            .next()
+            .expect("next random bag should start after exhaustion")
+            .label();
+        assert!(labels.contains(&label));
+    }
+
+    #[test]
+    fn zero_retries_allows_full_pool_attempts() {
+        let pool = ProxyPool::new(vec![http_proxy(1), http_proxy(2), http_proxy(3)], 0);
+        let labels: HashSet<String> = pool
+            .candidates()
+            .into_iter()
+            .map(|choice| choice.label())
+            .collect();
+        assert_eq!(labels.len(), 3);
+        assert!(labels.contains("http://127.0.0.1:1"));
+        assert!(labels.contains("http://127.0.0.1:2"));
+        assert!(labels.contains("http://127.0.0.1:3"));
+    }
+
+    #[test]
+    fn positive_retries_limits_attempts() {
         let pool = ProxyPool::new(vec![http_proxy(1), http_proxy(2), http_proxy(3)], 2);
         let labels: Vec<String> = pool
             .candidates()
             .into_iter()
-            .map(|choice| match choice {
-                ProxyChoice::Direct => "direct".to_owned(),
-                ProxyChoice::Proxy(entry) => entry.label.clone(),
-            })
+            .map(|choice| choice.label())
             .collect();
-        assert_eq!(labels, vec!["http://127.0.0.1:1", "http://127.0.0.1:2"]);
-
-        let labels: Vec<String> = pool
-            .candidates()
-            .into_iter()
-            .map(|choice| match choice {
-                ProxyChoice::Direct => "direct".to_owned(),
-                ProxyChoice::Proxy(entry) => entry.label.clone(),
-            })
-            .collect();
-        assert_eq!(labels, vec!["http://127.0.0.1:2", "http://127.0.0.1:3"]);
+        assert_eq!(labels.len(), 2);
+        assert_ne!(labels[0], labels[1]);
     }
 
     #[test]

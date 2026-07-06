@@ -1,12 +1,12 @@
 # RotatorProxy
 
-RotatorProxy 是一个单端口代理轮换器。它在一个本地端口同时接受 HTTP 代理请求、HTTPS `CONNECT` 和 SOCKS5/SOCKS5h 客户端连接，并为每个新请求从活动代理池中选择一个出站代理。如果没有加载到可用出站代理，请求会直接连接目标地址。
+RotatorProxy 是一个单端口代理轮换器。它在一个本地端口同时接受 HTTP 代理请求、HTTPS `CONNECT` 和 SOCKS5/SOCKS5h 客户端连接，并为每次出站尝试从活动代理池中伪随机选择一个代理。如果没有加载到可用出站代理，请求会直接连接目标地址。
 
 ## 功能
 
 - 单监听端口，自动识别 HTTP 和 SOCKS5 入站协议。
-- 出站代理按轮询选择，使用低竞争的原子索引。
-- 出站连接建立失败时自动尝试代理池中的后续节点，默认最多 10 次。
+- 出站代理按全局伪随机不放回方式选择：一轮内节点被取出后不会复用，耗尽后重新洗牌。
+- 出站连接建立失败时自动随机尝试代理池中的后续节点，默认最多 10 次，可设为 `0` 表示试完整个可用池。
 - 启动时先完整加载来源；默认会批量测活，也可以关闭健康预检查直接启用所有候选节点。
 - 支持按固定间隔或每天固定时间完整刷新来源，完成后无缝切换活动代理池。
 - 运行时故障冷却：活动节点连接失败后会临时跳过，多次冷却后可禁用到下次刷新。
@@ -35,7 +35,7 @@ cargo run --release -- --config config.toml
 
 - `listen`：本地入站代理端口地址。
 - `proxy_dirs`：需要扫描的文件或目录。目录只会进行非递归扫描。
-- `max_retries`：单个入站请求最多尝试多少个出站代理。
+- `max_retries`：单个入站请求最多尝试多少个出站代理。设为 `0` 时表示最多尝试当前可用池内每个节点一次。
 - `connect_timeout_ms`：连接目标地址或所选出站代理的超时时间。
 - `subscription_timeout_ms`：获取订阅 URL 的超时时间。
 - `subscription_user_agent`：获取订阅时使用的 User-Agent。
@@ -137,7 +137,7 @@ Reality 和真实 uTLS/client-fingerprint 支持使用 `meow-transport` 的 Bori
 
 RotatorProxy 不会监控输入目录变化。它只会在启动时和配置的刷新时间重新加载文件与订阅 URL。默认按 `daily_refresh_time` 每天刷新一次；设置 `refresh_interval_seconds` 后改为按固定间隔刷新。启动阶段不会先提供服务，而是等待所有来源加载、原生复杂节点构建、可选 Mihomo fallback 监听器准备，以及可选批量健康检查全部完成。定时刷新不会停止服务：当前活动代理池会继续处理请求，新的代理池会在下载、解析、准备和可选测活完成后一次性切换。
 
-批量测活时，RotatorProxy 会通过每个候选节点向 `health_check_url` 发起 HTTP/HTTPS 请求，类似 Clash/Mihomo 的 URL delay 测试，而不是 ICMP ping。响应状态码必须匹配 `health_check_expected_status`。通过测活的节点会记录本次延迟，活动池按延迟从低到高排序后再进入轮询。HTTPS 测活默认校验证书；只有私有或自签测活端点才建议设置 `health_check_tls_skip_verify = true`。节点如果在配置次数内全部测活失败，就不会进入活动轮换池。
+批量测活时，RotatorProxy 会通过每个候选节点向 `health_check_url` 发起 HTTP/HTTPS 请求，类似 Clash/Mihomo 的 URL delay 测试，而不是 ICMP ping。响应状态码必须匹配 `health_check_expected_status`。通过测活的节点会记录本次延迟，活动池按延迟从低到高排序后进入随机袋。HTTPS 测活默认校验证书；只有私有或自签测活端点才建议设置 `health_check_tls_skip_verify = true`。节点如果在配置次数内全部测活失败，就不会进入活动轮换池。
 
 设置 `health_check_enabled = false` 后，启动和刷新阶段不执行 URL delay 预检查，所有候选节点都会直接进入活动轮换池。正常转发流量时，已入池节点连接失败会按 `runtime_failure_threshold` 计数，达到阈值后进入 `cooldown_seconds` 冷却期并临时跳过。若同一刷新周期内同一节点达到 `runtime_disable_after_cooldowns` 次冷却阈值，该节点会被禁用到下一次刷新成功切换代理池。下一次订阅/来源刷新成功后，运行时失败状态会清空，节点可以重新参与轮换。
 
@@ -169,6 +169,7 @@ cargo test
 - HTTP `CONNECT` 转发。
 - SOCKS5 入站转发。
 - 第一个出站代理失败时重试下一个代理。
+- 出站节点伪随机不放回选择，`max_retries = 0` 时可试完整个可用池。
 - 批量健康刷新过滤失败代理并切换活动代理池。
 - 关闭健康预检查时直接加载所有候选代理。
 - 定时刷新全失败时保留上一版活动代理池。
