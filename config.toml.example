@@ -32,6 +32,10 @@ subscription_user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (K
 # Default log level. RUST_LOG overrides this value.
 log_level = "info"
 
+# Enable startup/refresh health prechecks. Set this to false to load every
+# candidate node into the active pool immediately.
+health_check_enabled = true
+
 # HTTP or HTTPS endpoint used to test outbound proxy liveness.
 # The default mirrors Clash/Mihomo-style URL delay checks.
 health_check_url = "http://cp.cloudflare.com/generate_204"
@@ -57,12 +61,20 @@ health_check_tls_skip_verify = false
 # Runtime connection failures before an active node enters cooldown.
 runtime_failure_threshold = 3
 
+# Cooldown entries in one refresh cycle before a node is disabled until the
+# next successful source/subscription refresh.
+runtime_disable_after_cooldowns = 2
+
 # How long a runtime-failing node is skipped before it can be tried again.
 cooldown_seconds = 300
 
 # Local time for the daily full reload + health check.
-# The service keeps serving with the previous active pool until the new pool is ready.
+# Used only when refresh_interval_seconds is unset.
 daily_refresh_time = "04:00"
+
+# Optional fixed source/subscription refresh interval in seconds. When set, it
+# takes precedence over daily_refresh_time.
+# refresh_interval_seconds = 3600
 
 # Enable the optional Mihomo sidecar fallback for Clash node types that the
 # in-process backend cannot currently dial. Most common TCP nodes are handled

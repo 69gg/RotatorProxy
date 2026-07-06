@@ -212,7 +212,7 @@ pub async fn refresh_proxy_pool(
     mihomo: &MihomoManager,
     reason: &str,
 ) -> Result<RefreshSummary> {
-    info!(reason, "开始重新加载代理来源并执行健康检查");
+    info!(reason, "开始重新加载代理来源");
     let loaded_set = load_proxies_from_dirs(config).await?;
     let loaded = loaded_set.total_len();
     info!(
@@ -249,7 +249,7 @@ pub async fn refresh_proxy_pool(
         candidates.extend_from_slice(prepared.nodes());
     }
 
-    let active = health_check_proxies(config, candidates).await?;
+    let active = select_active_proxies(config, candidates).await?;
     let active_len = active.len();
     if loaded > 0 && active_len == 0 {
         if reason != "startup" && !pool.is_empty() {
@@ -319,12 +319,28 @@ async fn apply_mihomo_generation(
     }
 }
 
-pub fn spawn_daily_refresh(
+pub fn spawn_refresh_scheduler(
     config: AppConfig,
     pool: ProxyPool,
     mihomo: MihomoManager,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        if let Some(interval_seconds) = config.refresh_interval_seconds {
+            let wait = Duration::from_secs(interval_seconds);
+            loop {
+                info!(
+                    refresh_interval_seconds = interval_seconds,
+                    wait_seconds = wait.as_secs(),
+                    "下一次代理刷新已计划"
+                );
+                sleep(wait).await;
+
+                if let Err(err) = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled").await {
+                    error!("定时代理刷新失败，将继续使用上一版活动代理池：{err:#}");
+                }
+            }
+        }
+
         let refresh_time = match parse_daily_refresh_time(&config.daily_refresh_time) {
             Ok(refresh_time) => refresh_time,
             Err(err) => {
@@ -347,6 +363,15 @@ pub fn spawn_daily_refresh(
             }
         }
     })
+}
+
+#[deprecated(note = "改用 spawn_refresh_scheduler，支持按间隔刷新和每日定时刷新")]
+pub fn spawn_daily_refresh(
+    config: AppConfig,
+    pool: ProxyPool,
+    mihomo: MihomoManager,
+) -> JoinHandle<()> {
+    spawn_refresh_scheduler(config, pool, mihomo)
 }
 
 pub fn parse_daily_refresh_time(value: &str) -> Result<NaiveTime> {
@@ -476,6 +501,26 @@ async fn health_check_proxies(
         );
     }
     Ok(active.into_iter().map(|result| result.proxy).collect())
+}
+
+async fn select_active_proxies(
+    config: &AppConfig,
+    proxies: Vec<ProxyNode>,
+) -> Result<Vec<ProxyNode>> {
+    if config.health_check_enabled {
+        return health_check_proxies(config, proxies).await;
+    }
+
+    let total = proxies.len();
+    if total == 0 {
+        info!("未加载到代理节点，将保持直连模式可用");
+    } else {
+        info!(
+            active_nodes = total,
+            "健康预检查已关闭，所有候选代理节点将直接加入活动代理池"
+        );
+    }
+    Ok(proxies)
 }
 
 async fn check_proxy_node(

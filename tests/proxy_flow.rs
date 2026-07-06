@@ -400,6 +400,49 @@ async fn health_refresh_filters_failed_proxy_and_swaps_pool() -> io::Result<()> 
 }
 
 #[tokio::test]
+async fn disabled_health_precheck_loads_all_candidates() -> io::Result<()> {
+    let bad_port = unused_local_port().await?;
+    let good_port = unused_local_port().await?;
+
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!("http://127.0.0.1:{bad_port}\nhttp://127.0.0.1:{good_port}\n"),
+    )
+    .unwrap();
+
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_enabled: false,
+        health_check_url: "not a url".to_owned(),
+        health_check_attempts: 0,
+        health_check_timeout_ms: 0,
+        health_check_concurrency: 0,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    config.validate().unwrap();
+    let pool = ProxyPool::with_runtime_options(Vec::new(), 2, 3, Duration::from_secs(60));
+    let mihomo = MihomoManager::new();
+
+    let summary = refresh_proxy_pool(&config, &pool, &mihomo, "test")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.loaded, 2);
+    assert_eq!(summary.active, 2);
+    assert_eq!(
+        labels_from_pool(&pool),
+        vec![
+            format!("http://127.0.0.1:{bad_port}"),
+            format!("http://127.0.0.1:{good_port}")
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn health_check_timeout_covers_stalled_response() -> io::Result<()> {
     let (target_addr, _first_line_rx, _target_handle) = spawn_http_target().await?;
     let (proxy_addr, _proxy_handle) = spawn_stalling_http_connect_proxy().await?;

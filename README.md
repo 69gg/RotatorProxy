@@ -7,9 +7,9 @@ RotatorProxy 是一个单端口代理轮换器。它在一个本地端口同时�
 - 单监听端口，自动识别 HTTP 和 SOCKS5 入站协议。
 - 出站代理按轮询选择，使用低竞争的原子索引。
 - 出站连接建立失败时自动尝试代理池中的后续节点，默认最多 10 次。
-- 启动时先完整加载来源并批量测活，测活完成后才开始提供服务。
-- 每天按配置时间完整刷新来源并批量测活，完成后无缝切换活动代理池。
-- 运行时故障冷却：活动节点连续连接失败后会临时跳过。
+- 启动时先完整加载来源；默认会批量测活，也可以关闭健康预检查直接启用所有候选节点。
+- 支持按固定间隔或每天固定时间完整刷新来源，完成后无缝切换活动代理池。
+- 运行时故障冷却：活动节点连接失败后会临时跳过，多次冷却后可禁用到下次刷新。
 - 代理池为空时自动使用直连模式。
 - 出站代理支持：
   - HTTP `CONNECT` 代理：`http://host:port`
@@ -27,7 +27,7 @@ cp config.toml.example config.toml
 cargo run --release -- --config config.toml
 ```
 
-启动时，RotatorProxy 会先加载所有配置的代理源，并对解析出的每个节点执行健康检查。初始刷新完成后才会开始监听端口。然后把 HTTP 或 SOCKS5 客户端指向配置里的 `listen` 地址，例如 `127.0.0.1:7890`。
+启动时，RotatorProxy 会先加载所有配置的代理源。默认会对解析出的每个节点执行健康检查；如果设置 `health_check_enabled = false`，则跳过预检查并直接启用所有候选节点。初始刷新完成后才会开始监听端口。然后把 HTTP 或 SOCKS5 客户端指向配置里的 `listen` 地址，例如 `127.0.0.1:7890`。
 
 ## 配置
 
@@ -41,14 +41,17 @@ cargo run --release -- --config config.toml
 - `subscription_user_agent`：获取订阅时使用的 User-Agent。
 - `subscription_proxy`：可选代理 URL，只用于获取订阅/Clash 配置 URL 和自动下载 Mihomo。支持 `http`、`https`、`socks4`、`socks4a`、`socks5`、`socks5h`。
 - `log_level`：默认日志级别。`RUST_LOG` 会覆盖该值。
+- `health_check_enabled`：是否启用启动/刷新阶段的健康预检查。默认 `true`；设为 `false` 时，所有候选节点直接进入活动池。
 - `health_check_url`：用于节点测活的 HTTP 或 HTTPS URL，默认 `http://cp.cloudflare.com/generate_204`。
 - `health_check_expected_status`：测活成功期望状态码，默认 `200-399`。支持精确值和逗号分隔范围；如果想严格检测 `generate_204`，可以设为 `204`。
 - `health_check_attempts`：节点被排除出活动代理池前的测活尝试次数。
 - `health_check_concurrency`：批量测活时的最大并发数。节点很多时建议设置为 `128` 到 `512`。
 - `health_check_tls_skip_verify`：显式设为 `true` 时跳过 HTTPS 测活证书校验，默认 `false`。
 - `runtime_failure_threshold`：活动节点运行时连接失败多少次后进入冷却。
+- `runtime_disable_after_cooldowns`：同一刷新周期内，节点进入冷却多少次后禁用到下次刷新，默认 `2`。如果关闭健康预检查并希望请求失败后立刻冷却，建议把 `runtime_failure_threshold` 设为 `1`。
 - `cooldown_seconds`：运行时故障节点被跳过的冷却时长。
-- `daily_refresh_time`：每天完整重新加载和测活的本地时间，格式为 `HH:MM`。
+- `daily_refresh_time`：每天完整重新加载和测活的本地时间，格式为 `HH:MM`。未设置 `refresh_interval_seconds` 时生效。
+- `refresh_interval_seconds`：可选固定刷新间隔，单位秒。设置后优先于 `daily_refresh_time`，用于更频繁地更新订阅 URL 和本地来源。
 - `mihomo_enabled`：启用可选 Mihomo sidecar fallback，用于进程内后端无法拨号的复杂 Clash 节点。默认关闭。
 - `mihomo_binary`：可选的 Mihomo 可执行文件路径。未设置时会依次在 `PATH` 中查找 `mihomo`、`clash-meta`、`clash`。
 - `mihomo_auto_download`：与 `mihomo_enabled` 同时启用时，Linux amd64/arm64 主机可自动下载最新 Mihomo release。
@@ -132,9 +135,11 @@ Reality 和真实 uTLS/client-fingerprint 支持使用 `meow-transport` 的 Bori
 
 ## 刷新和健康检查
 
-RotatorProxy 不会监控输入目录变化。它只会在启动时和配置的每日刷新时间重新加载文件与订阅 URL。启动阶段不会先提供服务，而是等待所有来源加载、原生复杂节点构建、可选 Mihomo fallback 监听器准备，以及批量健康检查全部完成。定时刷新不会停止服务：当前活动代理池会继续处理请求，新的代理池会在下载、解析、准备和测活完成后一次性切换。
+RotatorProxy 不会监控输入目录变化。它只会在启动时和配置的刷新时间重新加载文件与订阅 URL。默认按 `daily_refresh_time` 每天刷新一次；设置 `refresh_interval_seconds` 后改为按固定间隔刷新。启动阶段不会先提供服务，而是等待所有来源加载、原生复杂节点构建、可选 Mihomo fallback 监听器准备，以及可选批量健康检查全部完成。定时刷新不会停止服务：当前活动代理池会继续处理请求，新的代理池会在下载、解析、准备和可选测活完成后一次性切换。
 
-批量测活时，RotatorProxy 会通过每个候选节点向 `health_check_url` 发起 HTTP/HTTPS 请求，类似 Clash/Mihomo 的 URL delay 测试，而不是 ICMP ping。响应状态码必须匹配 `health_check_expected_status`。通过测活的节点会记录本次延迟，活动池按延迟从低到高排序后再进入轮询。HTTPS 测活默认校验证书；只有私有或自签测活端点才建议设置 `health_check_tls_skip_verify = true`。节点如果在配置次数内全部测活失败，就不会进入活动轮换池。正常转发流量时，已入池节点如果连续连接失败，会进入冷却并在冷却结束前被跳过。
+批量测活时，RotatorProxy 会通过每个候选节点向 `health_check_url` 发起 HTTP/HTTPS 请求，类似 Clash/Mihomo 的 URL delay 测试，而不是 ICMP ping。响应状态码必须匹配 `health_check_expected_status`。通过测活的节点会记录本次延迟，活动池按延迟从低到高排序后再进入轮询。HTTPS 测活默认校验证书；只有私有或自签测活端点才建议设置 `health_check_tls_skip_verify = true`。节点如果在配置次数内全部测活失败，就不会进入活动轮换池。
+
+设置 `health_check_enabled = false` 后，启动和刷新阶段不执行 URL delay 预检查，所有候选节点都会直接进入活动轮换池。正常转发流量时，已入池节点连接失败会按 `runtime_failure_threshold` 计数，达到阈值后进入 `cooldown_seconds` 冷却期并临时跳过。若同一刷新周期内同一节点达到 `runtime_disable_after_cooldowns` 次冷却阈值，该节点会被禁用到下一次刷新成功切换代理池。下一次订阅/来源刷新成功后，运行时失败状态会清空，节点可以重新参与轮换。
 
 启动阶段如果没有任何健康节点，会按空活动池启动。定时刷新阶段如果新一轮测活没有任何健康节点，RotatorProxy 会保留上一版活动池继续服务，避免公开源短时波动把可用池清空。
 
@@ -165,7 +170,9 @@ cargo test
 - SOCKS5 入站转发。
 - 第一个出站代理失败时重试下一个代理。
 - 批量健康刷新过滤失败代理并切换活动代理池。
+- 关闭健康预检查时直接加载所有候选代理。
 - 定时刷新全失败时保留上一版活动代理池。
+- 运行时重复冷却后禁用节点，并在刷新切池后恢复。
 - HTTPS 健康检查显式跳过证书校验。
 - 原生 Clash 节点、复杂 Clash 节点、HTTPS 代理和常见复杂 URI 链接的解析覆盖。
 - HTTPS 出站代理可参与批量健康检查。

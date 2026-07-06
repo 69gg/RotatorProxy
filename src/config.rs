@@ -16,6 +16,7 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/53
 const SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES: &[&str] =
     &["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
 const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_HEALTH_CHECK_ENABLED: bool = true;
 const DEFAULT_HEALTH_CHECK_URL: &str = "http://cp.cloudflare.com/generate_204";
 const DEFAULT_HEALTH_CHECK_EXPECTED_STATUS: &str = "200-399";
 const DEFAULT_HEALTH_CHECK_ATTEMPTS: usize = 3;
@@ -23,6 +24,7 @@ const DEFAULT_HEALTH_CHECK_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_HEALTH_CHECK_CONCURRENCY: usize = 256;
 const DEFAULT_HEALTH_CHECK_TLS_SKIP_VERIFY: bool = false;
 const DEFAULT_RUNTIME_FAILURE_THRESHOLD: usize = 3;
+const DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS: usize = 2;
 const DEFAULT_COOLDOWN_SECONDS: u64 = 300;
 const DEFAULT_DAILY_REFRESH_TIME: &str = "04:00";
 const DEFAULT_MIHOMO_ENABLED: bool = false;
@@ -44,6 +46,7 @@ pub struct AppConfig {
     pub subscription_user_agent: String,
     pub subscription_proxy: Option<String>,
     pub log_level: String,
+    pub health_check_enabled: bool,
     pub health_check_url: String,
     pub health_check_expected_status: String,
     pub health_check_attempts: usize,
@@ -51,8 +54,10 @@ pub struct AppConfig {
     pub health_check_concurrency: usize,
     pub health_check_tls_skip_verify: bool,
     pub runtime_failure_threshold: usize,
+    pub runtime_disable_after_cooldowns: usize,
     pub cooldown_seconds: u64,
     pub daily_refresh_time: String,
+    pub refresh_interval_seconds: Option<u64>,
     pub mihomo_enabled: bool,
     pub mihomo_binary: Option<PathBuf>,
     pub mihomo_auto_download: bool,
@@ -74,6 +79,7 @@ impl Default for AppConfig {
             subscription_user_agent: DEFAULT_USER_AGENT.to_owned(),
             subscription_proxy: None,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
+            health_check_enabled: DEFAULT_HEALTH_CHECK_ENABLED,
             health_check_url: DEFAULT_HEALTH_CHECK_URL.to_owned(),
             health_check_expected_status: DEFAULT_HEALTH_CHECK_EXPECTED_STATUS.to_owned(),
             health_check_attempts: DEFAULT_HEALTH_CHECK_ATTEMPTS,
@@ -81,8 +87,10 @@ impl Default for AppConfig {
             health_check_concurrency: DEFAULT_HEALTH_CHECK_CONCURRENCY,
             health_check_tls_skip_verify: DEFAULT_HEALTH_CHECK_TLS_SKIP_VERIFY,
             runtime_failure_threshold: DEFAULT_RUNTIME_FAILURE_THRESHOLD,
+            runtime_disable_after_cooldowns: DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS,
             cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
             daily_refresh_time: DEFAULT_DAILY_REFRESH_TIME.to_owned(),
+            refresh_interval_seconds: None,
             mihomo_enabled: DEFAULT_MIHOMO_ENABLED,
             mihomo_binary: None,
             mihomo_auto_download: DEFAULT_MIHOMO_AUTO_DOWNLOAD,
@@ -122,36 +130,49 @@ impl AppConfig {
         if let Some(proxy) = &self.subscription_proxy {
             validate_subscription_proxy(proxy)?;
         }
-        let health_url = Url::parse(&self.health_check_url)
-            .with_context(|| format!("health_check_url 无效：{}", self.health_check_url))?;
-        if !matches!(health_url.scheme(), "http" | "https") {
-            bail!("health_check_url 只支持 http:// 或 https:// URL");
-        }
-        if health_url.host_str().is_none() {
-            bail!("health_check_url 必须包含 host");
-        }
-        parse_health_check_expected_status(&self.health_check_expected_status)?;
-        if self.health_check_attempts == 0 {
-            bail!("health_check_attempts 必须大于 0");
-        }
-        if self.health_check_timeout_ms == 0 {
-            bail!("health_check_timeout_ms 必须大于 0");
-        }
-        if self.health_check_concurrency == 0 {
-            bail!("health_check_concurrency 必须大于 0");
+        if self.health_check_enabled {
+            let health_url = Url::parse(&self.health_check_url)
+                .with_context(|| format!("health_check_url 无效：{}", self.health_check_url))?;
+            if !matches!(health_url.scheme(), "http" | "https") {
+                bail!("health_check_url 只支持 http:// 或 https:// URL");
+            }
+            if health_url.host_str().is_none() {
+                bail!("health_check_url 必须包含 host");
+            }
+            parse_health_check_expected_status(&self.health_check_expected_status)?;
+            if self.health_check_attempts == 0 {
+                bail!("health_check_attempts 必须大于 0");
+            }
+            if self.health_check_timeout_ms == 0 {
+                bail!("health_check_timeout_ms 必须大于 0");
+            }
+            if self.health_check_concurrency == 0 {
+                bail!("health_check_concurrency 必须大于 0");
+            }
         }
         if self.runtime_failure_threshold == 0 {
             bail!("runtime_failure_threshold 必须大于 0");
         }
+        if self.runtime_disable_after_cooldowns == 0 {
+            bail!("runtime_disable_after_cooldowns 必须大于 0");
+        }
         if self.cooldown_seconds == 0 {
             bail!("cooldown_seconds 必须大于 0");
         }
-        NaiveTime::parse_from_str(&self.daily_refresh_time, "%H:%M").with_context(|| {
-            format!(
-                "daily_refresh_time 必须使用 HH:MM 格式，当前值为 {}",
-                self.daily_refresh_time
-            )
-        })?;
+        if self
+            .refresh_interval_seconds
+            .is_some_and(|seconds| seconds == 0)
+        {
+            bail!("refresh_interval_seconds 必须大于 0");
+        }
+        if self.refresh_interval_seconds.is_none() {
+            NaiveTime::parse_from_str(&self.daily_refresh_time, "%H:%M").with_context(|| {
+                format!(
+                    "daily_refresh_time 必须使用 HH:MM 格式，当前值为 {}",
+                    self.daily_refresh_time
+                )
+            })?;
+        }
         if self.mihomo_enabled {
             if self.mihomo_work_dir.as_os_str().is_empty() {
                 bail!("mihomo_enabled=true 时 mihomo_work_dir 不能为空");
@@ -285,6 +306,12 @@ proxy_dirs = ["./fixtures"]
         );
         assert_eq!(config.health_check_expected_status, "200-399");
         assert_eq!(config.health_check_attempts, DEFAULT_HEALTH_CHECK_ATTEMPTS);
+        assert!(config.health_check_enabled);
+        assert_eq!(
+            config.runtime_disable_after_cooldowns,
+            DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS
+        );
+        assert_eq!(config.refresh_interval_seconds, None);
         assert!(config.subscription_proxy.is_none());
         assert!(!config.mihomo_enabled);
         assert!(!config.mihomo_auto_download);
@@ -346,6 +373,20 @@ proxy_dirs = ["./fixtures"]
     }
 
     #[test]
+    fn disabled_health_check_ignores_health_target_settings() {
+        let config = AppConfig {
+            health_check_enabled: false,
+            health_check_url: "not a url".to_owned(),
+            health_check_expected_status: String::new(),
+            health_check_attempts: 0,
+            health_check_timeout_ms: 0,
+            health_check_concurrency: 0,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn parses_health_check_expected_status_ranges() {
         let ranges = parse_health_check_expected_status("204, 200-299").unwrap();
         assert!(ranges.iter().any(|range| range.contains(204)));
@@ -366,6 +407,34 @@ proxy_dirs = ["./fixtures"]
     fn rejects_invalid_daily_refresh_time() {
         let config = AppConfig {
             daily_refresh_time: "25:00".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn refresh_interval_overrides_daily_refresh_validation() {
+        let config = AppConfig {
+            refresh_interval_seconds: Some(3600),
+            daily_refresh_time: "25:00".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_refresh_interval() {
+        let config = AppConfig {
+            refresh_interval_seconds: Some(0),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_runtime_disable_after_cooldowns() {
+        let config = AppConfig {
+            runtime_disable_after_cooldowns: 0,
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());

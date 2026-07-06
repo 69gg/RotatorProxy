@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    collections::{HashMap, hash_map::DefaultHasher},
     fmt,
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
@@ -16,6 +16,7 @@ use shadowsocks::{ServerConfig, relay::socks5::Address as ShadowAddress};
 use tracing::{debug, info, warn};
 
 const FAILURE_SHARDS: usize = 64;
+const DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS: usize = 2;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HostPort {
@@ -291,6 +292,7 @@ struct ProxyPoolInner {
     next: AtomicUsize,
     max_retries: usize,
     runtime_failure_threshold: usize,
+    runtime_disable_after_cooldowns: usize,
     cooldown: Duration,
     failures: Vec<Mutex<HashMap<String, FailureRecord>>>,
 }
@@ -298,7 +300,9 @@ struct ProxyPoolInner {
 #[derive(Debug, Clone)]
 struct FailureRecord {
     failures: usize,
+    cooldowns: usize,
     cooldown_until: Option<Instant>,
+    disabled_until_refresh: bool,
 }
 
 impl ProxyPool {
@@ -312,12 +316,29 @@ impl ProxyPool {
         runtime_failure_threshold: usize,
         cooldown: Duration,
     ) -> Self {
+        Self::with_runtime_failure_policy(
+            proxies,
+            max_retries,
+            runtime_failure_threshold,
+            cooldown,
+            DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS,
+        )
+    }
+
+    pub fn with_runtime_failure_policy(
+        proxies: Vec<ProxyNode>,
+        max_retries: usize,
+        runtime_failure_threshold: usize,
+        cooldown: Duration,
+        runtime_disable_after_cooldowns: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(ProxyPoolInner {
                 proxies: RwLock::new(Arc::new(entries_from_nodes(proxies))),
                 next: AtomicUsize::new(0),
                 max_retries: max_retries.max(1),
                 runtime_failure_threshold: runtime_failure_threshold.max(1),
+                runtime_disable_after_cooldowns: runtime_disable_after_cooldowns.max(1),
                 cooldown,
                 failures: (0..FAILURE_SHARDS)
                     .map(|_| Mutex::new(HashMap::new()))
@@ -336,7 +357,6 @@ impl ProxyPool {
 
     pub fn replace(&self, proxies: Vec<ProxyNode>) {
         let entries = entries_from_nodes(proxies);
-        let live_keys: HashSet<String> = entries.iter().map(|entry| entry.key.clone()).collect();
         let new_len = entries.len();
         {
             let mut guard = self
@@ -346,10 +366,7 @@ impl ProxyPool {
                 .expect("proxy pool lock poisoned");
             *guard = Arc::new(entries);
         }
-        for shard in &self.inner.failures {
-            let mut failures = shard.lock().expect("proxy failure lock poisoned");
-            failures.retain(|key, _| live_keys.contains(key));
-        }
+        self.clear_failure_records();
         info!("活动代理池已切换，active_nodes={new_len}");
     }
 
@@ -370,7 +387,7 @@ impl ProxyPool {
                 break;
             }
             let entry = Arc::clone(&proxies[(start + offset) % len]);
-            if self.is_in_cooldown(&entry, now) {
+            if self.is_unavailable(&entry, now) {
                 continue;
             }
             choices.push(ProxyChoice::Proxy(entry));
@@ -384,7 +401,16 @@ impl ProxyPool {
             return;
         };
         let mut failures = self.failure_shard(&entry.key);
-        if failures.remove(&entry.key).is_some() {
+        let Some(record) = failures.get_mut(&entry.key) else {
+            return;
+        };
+        let had_pending_state = record.failures > 0 || record.cooldown_until.is_some();
+        record.failures = 0;
+        record.cooldown_until = None;
+        if !record.disabled_until_refresh && record.cooldowns == 0 {
+            failures.remove(&entry.key);
+        }
+        if had_pending_state {
             debug!(node = %entry.label, "代理运行时失败计数已在成功后重置");
         }
     }
@@ -397,8 +423,13 @@ impl ProxyPool {
         let mut failures = self.failure_shard(&entry.key);
         let record = failures.entry(entry.key.clone()).or_insert(FailureRecord {
             failures: 0,
+            cooldowns: 0,
             cooldown_until: None,
+            disabled_until_refresh: false,
         });
+        if record.disabled_until_refresh {
+            return;
+        }
         if record.cooldown_until.is_some_and(|until| until <= now) {
             record.failures = 0;
             record.cooldown_until = None;
@@ -407,12 +438,26 @@ impl ProxyPool {
         record.failures += 1;
         if record.failures >= self.inner.runtime_failure_threshold {
             record.failures = 0;
-            record.cooldown_until = Some(now + self.inner.cooldown);
-            warn!(
-                node = %entry.label,
-                cooldown_seconds = self.inner.cooldown.as_secs(),
-                "代理连续运行失败，已进入冷却期"
-            );
+            record.cooldowns += 1;
+            if record.cooldowns >= self.inner.runtime_disable_after_cooldowns {
+                record.cooldown_until = None;
+                record.disabled_until_refresh = true;
+                warn!(
+                    node = %entry.label,
+                    cooldowns = record.cooldowns,
+                    threshold = self.inner.runtime_disable_after_cooldowns,
+                    "代理在当前刷新周期内多次失败，已禁用到下次刷新"
+                );
+            } else {
+                record.cooldown_until = Some(now + self.inner.cooldown);
+                warn!(
+                    node = %entry.label,
+                    cooldown_seconds = self.inner.cooldown.as_secs(),
+                    cooldowns = record.cooldowns,
+                    disable_threshold = self.inner.runtime_disable_after_cooldowns,
+                    "代理连续运行失败，已进入冷却期"
+                );
+            }
         } else {
             warn!(
                 node = %entry.label,
@@ -440,11 +485,15 @@ impl ProxyPool {
             .expect("proxy failure lock poisoned")
     }
 
-    fn is_in_cooldown(&self, entry: &ProxyEntry, now: Instant) -> bool {
+    fn is_unavailable(&self, entry: &ProxyEntry, now: Instant) -> bool {
         let mut failures = self.failure_shard(&entry.key);
-        let Some(record) = failures.get(&entry.key) else {
+        let Some(record) = failures.get_mut(&entry.key) else {
             return false;
         };
+        if record.disabled_until_refresh {
+            debug!(node = %entry.label, "代理已禁用到下次刷新，已跳过");
+            return true;
+        }
         let Some(until) = record.cooldown_until else {
             return false;
         };
@@ -452,9 +501,17 @@ impl ProxyPool {
             debug!(node = %entry.label, "代理仍在冷却期，已跳过");
             return true;
         }
-        failures.remove(&entry.key);
+        record.failures = 0;
+        record.cooldown_until = None;
         debug!(node = %entry.label, "代理冷却期已结束");
         false
+    }
+
+    fn clear_failure_records(&self) {
+        for shard in &self.inner.failures {
+            let mut failures = shard.lock().expect("proxy failure lock poisoned");
+            failures.clear();
+        }
     }
 }
 
@@ -547,6 +604,32 @@ mod tests {
         assert!(pool.candidates().is_empty());
 
         std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(pool.candidates().len(), 1);
+    }
+
+    #[test]
+    fn proxy_disables_after_repeated_cooldowns_until_replace() {
+        let pool = ProxyPool::with_runtime_failure_policy(
+            vec![http_proxy(1)],
+            1,
+            1,
+            Duration::from_millis(30),
+            2,
+        );
+
+        let choice = pool.candidates().pop().unwrap();
+        pool.report_failure(&choice);
+        assert!(pool.candidates().is_empty());
+
+        std::thread::sleep(Duration::from_millis(40));
+        let choice = pool.candidates().pop().unwrap();
+        pool.report_failure(&choice);
+        assert!(pool.candidates().is_empty());
+
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(pool.candidates().is_empty());
+
+        pool.replace(vec![http_proxy(1)]);
         assert_eq!(pool.candidates().len(), 1);
     }
 

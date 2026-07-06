@@ -14,11 +14,12 @@ async fn main() -> Result<()> {
     let config = AppConfig::load(&config_path)?;
     init_logging(&config.log_level)?;
 
-    let pool = ProxyPool::with_runtime_options(
+    let pool = ProxyPool::with_runtime_failure_policy(
         Vec::new(),
         config.max_retries,
         config.runtime_failure_threshold,
         Duration::from_secs(config.cooldown_seconds),
+        config.runtime_disable_after_cooldowns,
     );
     let mihomo = MihomoManager::new();
     info!("启动阶段开始刷新代理，完成前暂不提供服务");
@@ -33,7 +34,7 @@ async fn main() -> Result<()> {
         pool.clone(),
         Duration::from_millis(config.connect_timeout_ms),
     );
-    let _refresh_handle = health::spawn_daily_refresh(config.clone(), pool, mihomo);
+    let _refresh_handle = health::spawn_refresh_scheduler(config.clone(), pool, mihomo);
     server::run(&config.listen, connector)
         .await
         .with_context(|| format!("代理服务在 {} 上运行失败", config.listen))
