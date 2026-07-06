@@ -203,11 +203,12 @@ async fn parse_content_queue(
         content,
         source,
         depth: 0,
+        allow_subscriptions: true,
     }]);
     let mut proxies = LoadedProxySet::default();
 
     while let Some(item) = queue.pop_front() {
-        let parsed = parse_local_content(&item.content, &item.source)?;
+        let parsed = parse_local_content(&item.content, &item.source, item.allow_subscriptions)?;
         proxies.extend(parsed.proxies);
 
         for decoded in parsed.decoded_contents {
@@ -215,6 +216,7 @@ async fn parse_content_queue(
                 content: decoded,
                 source: format!("{} <base64>", item.source),
                 depth: item.depth,
+                allow_subscriptions: false,
             });
         }
 
@@ -232,6 +234,7 @@ async fn parse_content_queue(
                     content: body,
                     source: url,
                     depth: item.depth + 1,
+                    allow_subscriptions: false,
                 }),
                 Err(err) => warn!("failed to fetch subscription {url}: {err:#}"),
             }
@@ -259,6 +262,7 @@ struct QueuedContent {
     content: String,
     source: String,
     depth: usize,
+    allow_subscriptions: bool,
 }
 
 #[derive(Default)]
@@ -268,7 +272,11 @@ struct LocalParseResult {
     decoded_contents: Vec<String>,
 }
 
-fn parse_local_content(content: &str, source: &str) -> Result<LocalParseResult> {
+fn parse_local_content(
+    content: &str,
+    source: &str,
+    allow_subscriptions: bool,
+) -> Result<LocalParseResult> {
     if let Some(decoded) = decode_base64_subscription(content) {
         return Ok(LocalParseResult {
             decoded_contents: vec![decoded],
@@ -285,22 +293,23 @@ fn parse_local_content(content: &str, source: &str) -> Result<LocalParseResult> 
 
     let mut result = LocalParseResult::default();
     for (index, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let Some(line) = normalize_source_line(line) else {
             continue;
-        }
+        };
 
         match parse_proxy_line(line) {
             Ok(Some(ParsedProxyLine::Native(proxy))) => result.proxies.native.push(proxy),
             Ok(Some(ParsedProxyLine::Mihomo(proxy))) => result.proxies.mihomo.push(proxy),
-            Ok(None) if is_subscription_url(line) => result.subscription_urls.push(line.to_owned()),
+            Ok(None) if allow_subscriptions && is_subscription_url(line) => {
+                result.subscription_urls.push(line.to_owned());
+            }
             Ok(None) => warn!(
                 "unsupported proxy source line {}:{}: {}",
                 source,
                 index + 1,
                 line
             ),
-            Err(err) if is_subscription_url(line) => {
+            Err(err) if allow_subscriptions && is_subscription_url(line) => {
                 debug!("treating line as subscription URL after proxy parse miss: {err}");
                 result.subscription_urls.push(line.to_owned());
             }
@@ -308,6 +317,25 @@ fn parse_local_content(content: &str, source: &str) -> Result<LocalParseResult> 
         }
     }
     Ok(result)
+}
+
+fn normalize_source_line(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    for (index, ch) in line.char_indices() {
+        if ch != '#' {
+            continue;
+        }
+        let previous = line[..index].chars().next_back()?;
+        if previous.is_whitespace() {
+            let stripped = line[..index].trim_end();
+            return (!stripped.is_empty()).then_some(stripped);
+        }
+    }
+    Some(line)
 }
 
 enum ParsedProxyLine {
@@ -642,7 +670,13 @@ fn credentials_from_url(url: &Url) -> Option<Credentials> {
 
 fn is_subscription_url(line: &str) -> bool {
     Url::parse(line)
-        .map(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.fragment().is_none()
+        })
         .unwrap_or(false)
 }
 
@@ -1186,6 +1220,9 @@ mod tests {
                 .is_none()
         );
         assert!(is_subscription_url("https://example.com/sub"));
+        assert!(!is_subscription_url(
+            "https://user:pass@example.com:443?sni=example.com#node"
+        ));
     }
 
     #[test]
@@ -1209,6 +1246,50 @@ mod tests {
         let encoded = BASE64_STANDARD.encode("socks5://127.0.0.1:1080\nhttp://127.0.0.1:8080\n");
         let decoded = decode_base64_subscription(&encoded).unwrap();
         assert!(decoded.contains("socks5://127.0.0.1:1080"));
+    }
+
+    #[test]
+    fn strips_comment_lines_and_whitespace_comments() {
+        assert_eq!(normalize_source_line("# comment"), None);
+        assert_eq!(
+            normalize_source_line("http://127.0.0.1:8080 # local proxy"),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            normalize_source_line("vless://id@example.com:443#node"),
+            Some("vless://id@example.com:443#node")
+        );
+    }
+
+    #[test]
+    fn fetched_proxy_lists_do_not_expand_nested_subscription_urls() {
+        let parsed = parse_local_content(
+            r#"
+# comment
+https://example.com/nested-sub
+https://user:pass@example.com:443?sni=example.com#proxy-node
+http://127.0.0.1:8080 # inline comment
+"#,
+            "fetched",
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.subscription_urls.len(), 0);
+        assert_eq!(parsed.proxies.native.len(), 1);
+    }
+
+    #[test]
+    fn local_source_lists_can_still_contain_subscription_urls() {
+        let parsed = parse_local_content(
+            "https://example.com/subscription.txt # source list\n",
+            "local",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.subscription_urls,
+            vec!["https://example.com/subscription.txt"]
+        );
     }
 
     #[tokio::test]
@@ -1328,7 +1409,7 @@ proxies:
     #[test]
     fn parses_local_content_with_decoded_queue_marker() {
         let encoded = BASE64_STANDARD.encode("socks5://127.0.0.1:1080\n");
-        let parsed = parse_local_content(&encoded, "test").unwrap();
+        let parsed = parse_local_content(&encoded, "test", true).unwrap();
         assert_eq!(parsed.decoded_contents.len(), 1);
     }
 }

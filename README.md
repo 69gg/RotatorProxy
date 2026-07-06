@@ -64,10 +64,12 @@ cargo run --release -- --config config.toml
 普通代理列表：
 
 ```text
+# 以 # 开头的行会被忽略
 http://user:pass@127.0.0.1:8080
 socks5://127.0.0.1:1080
 socks5h://127.0.0.1:1080
 ss://YWVzLTI1Ni1nY206cGFzc0BleGFtcGxlLmNvbTo4Mzg4#example
+http://127.0.0.1:8080 # 空白后的 # 会被视为行尾注释
 ```
 
 订阅 URL 列表：
@@ -78,6 +80,8 @@ https://example.com/clash.yaml
 ```
 
 如果设置了 `subscription_proxy`，这些 HTTP/HTTPS 来源会通过该代理获取。需要让订阅域名也通过代理解析时，使用 `socks5h://...`。该设置只用于下载配置输入，不参与运行时出站轮换。
+
+只有本地代理源文件中的 HTTP/HTTPS 行会被当作订阅 URL 展开。下载回来的行式代理内容会按“一行一个代理”处理，不会把其中的 HTTP/HTTPS 行继续递归抓取；这样可以避免把带 `#节点名`、账号或端口的代理链接误判成订阅。
 
 Clash YAML：
 
