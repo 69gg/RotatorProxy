@@ -21,6 +21,12 @@ subscription_timeout_ms = 15000
 # User-Agent sent when fetching subscription URLs.
 subscription_user_agent = "RotatorProxy/0.1"
 
+# Optional proxy used when fetching subscription/Clash config URLs and when
+# auto-downloading Mihomo. This does not affect runtime outbound rotation.
+# Supported schemes: http, https, socks4, socks4a, socks5, socks5h.
+# Use socks5h when you want DNS resolution to happen through the proxy.
+# subscription_proxy = "socks5h://127.0.0.1:1080"
+
 # Default log level. RUST_LOG overrides this value.
 log_level = "info"
 

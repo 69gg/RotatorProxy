@@ -13,6 +13,8 @@ const DEFAULT_MAX_RETRIES: usize = 10;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SUBSCRIPTION_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_USER_AGENT: &str = "RotatorProxy/0.1";
+const SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES: &[&str] =
+    &["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_HEALTH_CHECK_URL: &str = "http://example.com/";
 const DEFAULT_HEALTH_CHECK_ATTEMPTS: usize = 3;
@@ -38,6 +40,7 @@ pub struct AppConfig {
     pub connect_timeout_ms: u64,
     pub subscription_timeout_ms: u64,
     pub subscription_user_agent: String,
+    pub subscription_proxy: Option<String>,
     pub log_level: String,
     pub health_check_url: String,
     pub health_check_attempts: usize,
@@ -65,6 +68,7 @@ impl Default for AppConfig {
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             subscription_timeout_ms: DEFAULT_SUBSCRIPTION_TIMEOUT_MS,
             subscription_user_agent: DEFAULT_USER_AGENT.to_owned(),
+            subscription_proxy: None,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             health_check_url: DEFAULT_HEALTH_CHECK_URL.to_owned(),
             health_check_attempts: DEFAULT_HEALTH_CHECK_ATTEMPTS,
@@ -108,6 +112,9 @@ impl AppConfig {
         }
         if self.subscription_user_agent.trim().is_empty() {
             bail!("subscription_user_agent must not be empty");
+        }
+        if let Some(proxy) = &self.subscription_proxy {
+            validate_subscription_proxy(proxy)?;
         }
         let health_url = Url::parse(&self.health_check_url)
             .with_context(|| format!("invalid health_check_url {}", self.health_check_url))?;
@@ -156,6 +163,29 @@ impl AppConfig {
     }
 }
 
+pub fn supported_subscription_proxy_scheme(scheme: &str) -> bool {
+    SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES.contains(&scheme)
+}
+
+fn validate_subscription_proxy(proxy: &str) -> Result<()> {
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        bail!("subscription_proxy must not be empty when set");
+    }
+    let url =
+        Url::parse(proxy).with_context(|| format!("invalid subscription_proxy URL {proxy}"))?;
+    if !supported_subscription_proxy_scheme(url.scheme()) {
+        bail!(
+            "subscription_proxy supports only these schemes: {}",
+            SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES.join(", ")
+        );
+    }
+    if url.host_str().is_none() {
+        bail!("subscription_proxy must include a host");
+    }
+    Ok(())
+}
+
 pub fn config_path_from_args() -> PathBuf {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -191,6 +221,7 @@ proxy_dirs = ["./fixtures"]
         assert_eq!(config.listen, "127.0.0.1:9000");
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
         assert_eq!(config.health_check_attempts, DEFAULT_HEALTH_CHECK_ATTEMPTS);
+        assert!(config.subscription_proxy.is_none());
         assert!(!config.mihomo_enabled);
         assert!(!config.mihomo_auto_download);
         assert_eq!(
@@ -217,6 +248,24 @@ proxy_dirs = ["./fixtures"]
             ..AppConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_socks_subscription_proxy() {
+        let config = AppConfig {
+            subscription_proxy: Some("socks5h://127.0.0.1:1080".to_owned()),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_subscription_proxy_scheme() {
+        let config = AppConfig {
+            subscription_proxy: Some("ftp://127.0.0.1:21".to_owned()),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

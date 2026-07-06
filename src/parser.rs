@@ -16,11 +16,11 @@ use base64::{
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use shadowsocks::{ServerConfig, config::ServerAddr, crypto::CipherKind};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::{Url, form_urlencoded};
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, supported_subscription_proxy_scheme},
     proxy::{Credentials, HostPort, ProxyNode},
 };
 
@@ -77,6 +77,7 @@ pub struct MihomoProxyConfig {
 pub struct SubscriptionOptions {
     pub timeout: Duration,
     pub user_agent: String,
+    pub proxy: Option<String>,
 }
 
 impl From<&AppConfig> for SubscriptionOptions {
@@ -84,6 +85,7 @@ impl From<&AppConfig> for SubscriptionOptions {
         Self {
             timeout: Duration::from_millis(config.subscription_timeout_ms),
             user_agent: config.subscription_user_agent.clone(),
+            proxy: config.subscription_proxy.clone(),
         }
     }
 }
@@ -97,11 +99,7 @@ pub async fn load_proxies_from_paths(
     paths: &[PathBuf],
     options: &SubscriptionOptions,
 ) -> Result<LoadedProxySet> {
-    let client = reqwest::Client::builder()
-        .timeout(options.timeout)
-        .user_agent(options.user_agent.clone())
-        .build()
-        .context("failed to build subscription HTTP client")?;
+    let client = build_subscription_client(options)?;
 
     let mut proxies = LoadedProxySet::default();
     for path in paths {
@@ -115,6 +113,56 @@ pub async fn load_proxies_from_paths(
         }
     }
     Ok(proxies)
+}
+
+pub fn build_subscription_client(options: &SubscriptionOptions) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(options.timeout)
+        .user_agent(options.user_agent.clone());
+    if let Some(proxy) = options.proxy.as_deref().map(str::trim) {
+        validate_reqwest_proxy_url(proxy)?;
+        info!(
+            proxy = %redact_proxy_url(proxy),
+            "external fetch proxy enabled"
+        );
+        builder = builder.proxy(reqwest::Proxy::all(proxy).with_context(|| {
+            format!("invalid subscription_proxy URL {}", redact_proxy_url(proxy))
+        })?);
+    }
+    builder
+        .build()
+        .context("failed to build subscription HTTP client")
+}
+
+fn validate_reqwest_proxy_url(proxy: &str) -> Result<()> {
+    if proxy.is_empty() {
+        return Err(anyhow!("subscription_proxy must not be empty"));
+    }
+    let url =
+        Url::parse(proxy).with_context(|| format!("invalid subscription_proxy URL {proxy}"))?;
+    if !supported_subscription_proxy_scheme(url.scheme()) {
+        return Err(anyhow!(
+            "subscription_proxy scheme {} is not supported",
+            url.scheme()
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err(anyhow!("subscription_proxy must include a host"));
+    }
+    Ok(())
+}
+
+fn redact_proxy_url(proxy: &str) -> String {
+    let Ok(mut url) = Url::parse(proxy) else {
+        return "<invalid>".to_owned();
+    };
+    if !url.username().is_empty() {
+        let _ = url.set_username("redacted");
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("redacted"));
+    }
+    url.to_string()
 }
 
 fn collect_source_files(path: &Path) -> Result<Vec<PathBuf>> {
@@ -1059,6 +1107,61 @@ struct VmessLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+    };
+
+    async fn spawn_subscription_proxy(
+        body: &'static str,
+    ) -> io::Result<(
+        String,
+        oneshot::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(header) = read_test_http_header(&mut stream).await else {
+                return;
+            };
+            let first_line = String::from_utf8_lossy(&header)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let _ = tx.send(first_line);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        Ok((format!("http://{addr}"), rx, handle))
+    }
+
+    async fn read_test_http_header(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+        let mut header = Vec::new();
+        let mut byte = [0_u8; 1];
+        while header.len() < 16 * 1024 {
+            stream.read_exact(&mut byte).await?;
+            header.push(byte[0]);
+            if header.ends_with(b"\r\n\r\n") {
+                return Ok(header);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "test HTTP header exceeded limit",
+        ))
+    }
 
     #[test]
     fn parses_http_proxy_url() {
@@ -1106,6 +1209,29 @@ mod tests {
         let encoded = BASE64_STANDARD.encode("socks5://127.0.0.1:1080\nhttp://127.0.0.1:8080\n");
         let decoded = decode_base64_subscription(&encoded).unwrap();
         assert!(decoded.contains("socks5://127.0.0.1:1080"));
+    }
+
+    #[tokio::test]
+    async fn fetches_subscription_through_configured_proxy() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source_path = dir.path().join("sources.txt");
+        fs::write(&source_path, "http://subscription.invalid/list\n")?;
+        let (proxy_url, first_line_rx, _handle) =
+            spawn_subscription_proxy("http://127.0.0.1:8080\n").await?;
+        let options = SubscriptionOptions {
+            timeout: Duration::from_secs(2),
+            user_agent: "RotatorProxyTest/0.1".to_owned(),
+            proxy: Some(proxy_url),
+        };
+
+        let proxies = load_proxies_from_paths(&[source_path], &options).await?;
+
+        assert_eq!(proxies.native.len(), 1);
+        assert_eq!(
+            first_line_rx.await.unwrap(),
+            "GET http://subscription.invalid/list HTTP/1.1"
+        );
+        Ok(())
     }
 
     #[test]

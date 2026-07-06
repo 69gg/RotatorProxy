@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::AppConfig,
-    parser::MihomoProxyConfig,
+    parser::{MihomoProxyConfig, SubscriptionOptions, build_subscription_client},
     proxy::{HostPort, ProxyNode},
 };
 
@@ -415,10 +415,7 @@ fn find_binary_in_path(names: &[&str]) -> Option<PathBuf> {
 
 async fn download_linux_mihomo(config: &AppConfig) -> Result<PathBuf> {
     let arch = linux_mihomo_arch()?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(config.subscription_timeout_ms))
-        .user_agent(config.subscription_user_agent.clone())
-        .build()
+    let client = build_subscription_client(&SubscriptionOptions::from(config))
         .context("failed to build mihomo download HTTP client")?;
     let release_body = client
         .get(GITHUB_LATEST_RELEASE_URL)

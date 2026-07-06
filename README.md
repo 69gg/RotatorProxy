@@ -39,6 +39,7 @@ See [config.toml.example](config.toml.example). The important fields are:
 - `connect_timeout_ms`: timeout for connecting to the target or selected outbound proxy.
 - `subscription_timeout_ms`: timeout when fetching subscription URLs.
 - `subscription_user_agent`: User-Agent used for subscription HTTP requests.
+- `subscription_proxy`: optional proxy URL used only for fetching subscription/Clash config URLs and auto-downloading Mihomo. Supports `http`, `https`, `socks4`, `socks4a`, `socks5`, and `socks5h`.
 - `log_level`: default tracing level. `RUST_LOG` overrides it.
 - `health_check_url`: HTTP or HTTPS URL used for node liveness checks. Any 2xx/3xx response passes.
 - `health_check_attempts`: failed attempts before a node is excluded from the active pool.
@@ -75,6 +76,8 @@ Subscription URL list:
 https://example.com/subscription/base64
 https://example.com/clash.yaml
 ```
+
+If `subscription_proxy` is set, these HTTP/HTTPS source fetches are made through that proxy. Use `socks5h://...` when the subscription host should be resolved by the proxy rather than locally. This setting is only for downloading configuration inputs; it is not part of the runtime outbound rotation pool.
 
 Clash YAML:
 
