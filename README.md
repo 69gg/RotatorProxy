@@ -1,67 +1,67 @@
 # RotatorProxy
 
-RotatorProxy is a single-port proxy rotator. It accepts HTTP proxy requests, HTTPS `CONNECT`, and SOCKS5/SOCKS5h-style clients on one local port, then chooses one outbound proxy from the configured pool for each new request. If no outbound proxies are loaded, traffic is sent directly.
+RotatorProxy 是一个单端口代理轮换器。它在一个本地端口同时接受 HTTP 代理请求、HTTPS `CONNECT` 和 SOCKS5/SOCKS5h 客户端连接，并为每个新请求从活动代理池中选择一个出站代理。如果没有加载到可用出站代理，请求会直接连接目标地址。
 
-## Features
+## 功能
 
-- Single listening port with automatic HTTP/SOCKS5 detection.
-- Round-robin outbound selection with low-contention atomic indexing.
-- Connection-setup retry across the next proxies in the pool; default is 10 attempts.
-- Startup full reload + batch health check before the service starts accepting traffic.
-- Daily scheduled full reload + batch health check with seamless active-pool swap.
-- Runtime cooldown: an active node is skipped temporarily after repeated connection failures.
-- Direct mode when the proxy pool is empty.
-- Outbound support for:
-  - HTTP `CONNECT` proxies via `http://host:port`
-  - SOCKS5 and SOCKS5h via `socks5://host:port` and `socks5h://host:port`
-  - SOCKS4 and SOCKS4a via `socks4://host:port` and `socks4a://host:port`
-  - Shadowsocks SIP002 `ss://` URLs
-  - In-process complex nodes through `meow-proxy`: VMess, VLESS, Trojan, Hysteria2/Hy2, Snell, AnyTLS, Reality TLS, uTLS/client-fingerprint, and Shadowsocks with supported built-in plugins
-  - Optional Mihomo sidecar fallback for complex nodes that are not supported by the in-process backend
-- Source loading from local files/directories, subscription URLs, Clash YAML, and common Base64 subscriptions.
+- 单监听端口，自动识别 HTTP 和 SOCKS5 入站协议。
+- 出站代理按轮询选择，使用低竞争的原子索引。
+- 出站连接建立失败时自动尝试代理池中的后续节点，默认最多 10 次。
+- 启动时先完整加载来源并批量测活，测活完成后才开始提供服务。
+- 每天按配置时间完整刷新来源并批量测活，完成后无缝切换活动代理池。
+- 运行时故障冷却：活动节点连续连接失败后会临时跳过。
+- 代理池为空时自动使用直连模式。
+- 出站代理支持：
+  - HTTP `CONNECT` 代理：`http://host:port`
+  - SOCKS5 和 SOCKS5h：`socks5://host:port`、`socks5h://host:port`
+  - SOCKS4 和 SOCKS4a：`socks4://host:port`、`socks4a://host:port`
+  - Shadowsocks SIP002 `ss://` 链接
+  - 基于 `meow-proxy` 的进程内复杂节点：VMess、VLESS、Trojan、Hysteria2/Hy2、Snell、AnyTLS、Reality TLS、uTLS/client-fingerprint，以及带受支持内置插件的 Shadowsocks
+  - 对进程内后端暂不支持的复杂节点，可选使用 Mihomo sidecar fallback
+- 支持从本地文件/目录、订阅 URL、Clash YAML 和常见 Base64 订阅中加载代理源。
 
-## Quick Start
+## 快速开始
 
 ```bash
 cp config.toml.example config.toml
 cargo run --release -- --config config.toml
 ```
 
-On startup, RotatorProxy first loads all configured sources and health-checks every parsed node. It starts listening only after that initial refresh finishes. Point an HTTP or SOCKS5 client at the configured `listen` address, for example `127.0.0.1:7890`.
+启动时，RotatorProxy 会先加载所有配置的代理源，并对解析出的每个节点执行健康检查。初始刷新完成后才会开始监听端口。然后把 HTTP 或 SOCKS5 客户端指向配置里的 `listen` 地址，例如 `127.0.0.1:7890`。
 
-## Configuration
+## 配置
 
-See [config.toml.example](config.toml.example). The important fields are:
+参见 [config.toml.example](config.toml.example)。主要配置项如下：
 
-- `listen`: local address for the single inbound proxy port.
-- `proxy_dirs`: files or directories to scan. Directories are scanned non-recursively.
-- `max_retries`: maximum outbound connection attempts per inbound request.
-- `connect_timeout_ms`: timeout for connecting to the target or selected outbound proxy.
-- `subscription_timeout_ms`: timeout when fetching subscription URLs.
-- `subscription_user_agent`: User-Agent used for subscription HTTP requests.
-- `subscription_proxy`: optional proxy URL used only for fetching subscription/Clash config URLs and auto-downloading Mihomo. Supports `http`, `https`, `socks4`, `socks4a`, `socks5`, and `socks5h`.
-- `log_level`: default tracing level. `RUST_LOG` overrides it.
-- `health_check_url`: HTTP or HTTPS URL used for node liveness checks. Any 2xx/3xx response passes.
-- `health_check_attempts`: failed attempts before a node is excluded from the active pool.
-- `health_check_concurrency`: maximum concurrent health checks during a batch.
-- `health_check_tls_skip_verify`: disables HTTPS health-check certificate verification when explicitly set. Defaults to `false`.
-- `runtime_failure_threshold`: runtime connection failures before an active node enters cooldown.
-- `cooldown_seconds`: duration for skipping a runtime-failing active node.
-- `daily_refresh_time`: local `HH:MM` time for the daily full source reload and health check.
-- `mihomo_enabled`: enables the optional Mihomo sidecar fallback for complex Clash node types that the embedded backend cannot dial. Disabled by default.
-- `mihomo_binary`: optional explicit Mihomo binary path. If unset, `mihomo`, `clash-meta`, then `clash` are searched in `PATH`.
-- `mihomo_auto_download`: when enabled together with `mihomo_enabled`, Linux amd64/arm64 hosts can download the latest Mihomo release automatically.
-- `mihomo_work_dir`: runtime directory for downloaded binaries and generated sidecar configs.
-- `mihomo_startup_timeout_ms`: maximum wait for a new Mihomo generation to open its local listeners.
-- `mihomo_retire_grace_seconds`: delay before an old Mihomo generation is killed after a pool swap.
+- `listen`：本地入站代理端口地址。
+- `proxy_dirs`：需要扫描的文件或目录。目录只会进行非递归扫描。
+- `max_retries`：单个入站请求最多尝试多少个出站代理。
+- `connect_timeout_ms`：连接目标地址或所选出站代理的超时时间。
+- `subscription_timeout_ms`：获取订阅 URL 的超时时间。
+- `subscription_user_agent`：获取订阅时使用的 User-Agent。
+- `subscription_proxy`：可选代理 URL，只用于获取订阅/Clash 配置 URL 和自动下载 Mihomo。支持 `http`、`https`、`socks4`、`socks4a`、`socks5`、`socks5h`。
+- `log_level`：默认日志级别。`RUST_LOG` 会覆盖该值。
+- `health_check_url`：用于节点测活的 HTTP 或 HTTPS URL。返回任意 2xx/3xx 状态码即认为健康。
+- `health_check_attempts`：节点被排除出活动代理池前的测活尝试次数。
+- `health_check_concurrency`：批量测活时的最大并发数。
+- `health_check_tls_skip_verify`：显式设为 `true` 时跳过 HTTPS 测活证书校验，默认 `false`。
+- `runtime_failure_threshold`：活动节点运行时连接失败多少次后进入冷却。
+- `cooldown_seconds`：运行时故障节点被跳过的冷却时长。
+- `daily_refresh_time`：每天完整重新加载和测活的本地时间，格式为 `HH:MM`。
+- `mihomo_enabled`：启用可选 Mihomo sidecar fallback，用于进程内后端无法拨号的复杂 Clash 节点。默认关闭。
+- `mihomo_binary`：可选的 Mihomo 可执行文件路径。未设置时会依次在 `PATH` 中查找 `mihomo`、`clash-meta`、`clash`。
+- `mihomo_auto_download`：与 `mihomo_enabled` 同时启用时，Linux amd64/arm64 主机可自动下载最新 Mihomo release。
+- `mihomo_work_dir`：下载的二进制和生成的 sidecar 配置所在运行目录。
+- `mihomo_startup_timeout_ms`：等待新 Mihomo generation 打开本地监听端口的最长时间。
+- `mihomo_retire_grace_seconds`：代理池切换后，旧 Mihomo generation 延迟退出的时间。
 
-`config.toml` and `.rotator-proxy/` are intentionally ignored by Git.
+`config.toml` 和 `.rotator-proxy/` 会被 Git 忽略。
 
-## Proxy Sources
+## 代理源
 
-Each file in `proxy_dirs` can be one of these forms:
+`proxy_dirs` 中的每个文件可以是以下几种形式之一。
 
-Plain proxy list:
+普通代理列表：
 
 ```text
 http://user:pass@127.0.0.1:8080
@@ -70,16 +70,16 @@ socks5h://127.0.0.1:1080
 ss://YWVzLTI1Ni1nY206cGFzc0BleGFtcGxlLmNvbTo4Mzg4#example
 ```
 
-Subscription URL list:
+订阅 URL 列表：
 
 ```text
 https://example.com/subscription/base64
 https://example.com/clash.yaml
 ```
 
-If `subscription_proxy` is set, these HTTP/HTTPS source fetches are made through that proxy. Use `socks5h://...` when the subscription host should be resolved by the proxy rather than locally. This setting is only for downloading configuration inputs; it is not part of the runtime outbound rotation pool.
+如果设置了 `subscription_proxy`，这些 HTTP/HTTPS 来源会通过该代理获取。需要让订阅域名也通过代理解析时，使用 `socks5h://...`。该设置只用于下载配置输入，不参与运行时出站轮换。
 
-Clash YAML:
+Clash YAML：
 
 ```yaml
 proxies:
@@ -108,41 +108,41 @@ proxies:
       path: /ws
 ```
 
-Base64 subscriptions are supported when the entire fetched body or file content is a Base64-encoded text document. After decoding, RotatorProxy parses the decoded content as the same line-based or Clash YAML formats.
+当整个文件内容或订阅响应体是 Base64 编码的文本时，RotatorProxy 会自动解码，并按同样的行格式或 Clash YAML 格式继续解析。
 
-Common URI-style complex links such as `vmess://`, `vless://`, `trojan://`, `hysteria2://`, `hy2://`, `anytls://`, `ssr://`, and `tuic://` are converted into Clash-style node objects. Full Clash YAML remains the most complete format because unknown or protocol-specific fields are preserved for the native builder or optional Mihomo fallback.
+常见 URI 风格复杂链接，例如 `vmess://`、`vless://`、`trojan://`、`hysteria2://`、`hy2://`、`anytls://`、`ssr://`、`tuic://`，会被转换成 Clash 风格节点对象。完整 Clash YAML 仍然是最完整的输入格式，因为未知字段和协议特定字段会被保留下来，供原生构建器或可选 Mihomo fallback 使用。
 
-## Clash-Compatible Nodes
+## Clash 兼容节点
 
-RotatorProxy handles common TCP proxy protocols in-process. Simple protocols use local implementations: HTTP, SOCKS4/5, and plain Shadowsocks. Complex Clash-compatible nodes are first built with the embedded `meow-proxy` backend. That path currently covers VMess, VLESS, Trojan, Hysteria2/Hy2, Snell, AnyTLS, Reality TLS, uTLS/client-fingerprint profiles, and Shadowsocks with supported built-in plugins.
+RotatorProxy 在进程内处理常见 TCP 代理协议。简单协议使用本地实现：HTTP、SOCKS4/5 和普通 Shadowsocks。复杂 Clash 兼容节点会优先交给内嵌 `meow-proxy` 后端构建。目前该路径覆盖 VMess、VLESS、Trojan、Hysteria2/Hy2、Snell、AnyTLS、Reality TLS、uTLS/client-fingerprint 配置，以及带受支持内置插件的 Shadowsocks。
 
-Reality and real uTLS/client-fingerprint support use `meow-transport`'s BoringSSL-backed TLS path inside the Rust process. No external Mihomo binary is needed for those nodes, but Linux builds need the normal native toolchain required by `boring-sys`.
+Reality 和真实 uTLS/client-fingerprint 支持使用 `meow-transport` 的 BoringSSL TLS 路径，仍在 Rust 进程内完成。此类节点不需要外部 Mihomo 二进制，但 Linux 构建需要 `boring-sys` 所需的常规原生工具链。
 
-When a node uses fields that the embedded backend cannot safely reproduce, such as TUIC, WireGuard/WG, Mieru, SSH, or SSR, it is sent to the optional Mihomo fallback queue. Mihomo fallback is disabled by default. With the default config, unsupported fallback-only nodes are logged and skipped instead of starting or downloading an external executable.
+当节点使用内嵌后端无法可靠复现的字段或协议时，例如 TUIC、WireGuard/WG、Mieru、SSH 或 SSR，该节点会进入可选 Mihomo fallback 队列。Mihomo fallback 默认关闭。在默认配置下，只有 fallback 才能支持的节点会被记录日志并跳过，不会启动或下载外部可执行文件。
 
-If `mihomo_enabled = true`, RotatorProxy generates one local Mihomo `mixed` listener per fallback node, bound to `127.0.0.1`, and sets that listener's `proxy` field to exactly one internal proxy name. The rotator then treats that listener as a normal outbound candidate. This avoids global selector switching and keeps concurrent requests pinned to the node selected by the rotator.
+如果设置 `mihomo_enabled = true`，RotatorProxy 会为每个 fallback 节点生成一个本地 Mihomo `mixed` 监听器，绑定到 `127.0.0.1`，并把该监听器的 `proxy` 字段固定到一个内部代理名。轮换器随后把这个监听器当作普通出站候选节点处理。这样可以避免全局 selector 切换，并让并发请求稳定绑定到轮换器选择的节点。
 
-On Linux `x86_64` and `aarch64`, RotatorProxy can automatically download the latest Mihomo gzip release asset for `amd64` or `arm64` when both `mihomo_enabled` and `mihomo_auto_download` are true. On other platforms, or if you want fixed binary provenance, install Mihomo yourself and set `mihomo_binary` or put it in `PATH`.
+在 Linux `x86_64` 和 `aarch64` 上，当同时启用 `mihomo_enabled` 和 `mihomo_auto_download` 时，RotatorProxy 可以自动下载最新 Mihomo gzip release 中的 `amd64` 或 `arm64` 资源。其他平台，或需要固定二进制来源时，请自行安装 Mihomo，并设置 `mihomo_binary` 或放入 `PATH`。
 
-## Refresh And Health Checks
+## 刷新和健康检查
 
-RotatorProxy does not watch input directories. It reloads files and subscription URLs only at startup and at the configured daily refresh time. Startup does not provide service until all sources are loaded, native complex nodes and optional Mihomo fallback listeners are prepared, and batch health checks finish. Scheduled refreshes do not stop the service: the current active pool keeps serving while the new pool is downloaded, parsed, prepared, and health-checked, then the active pool is swapped in one step.
+RotatorProxy 不会监控输入目录变化。它只会在启动时和配置的每日刷新时间重新加载文件与订阅 URL。启动阶段不会先提供服务，而是等待所有来源加载、原生复杂节点构建、可选 Mihomo fallback 监听器准备，以及批量健康检查全部完成。定时刷新不会停止服务：当前活动代理池会继续处理请求，新的代理池会在下载、解析、准备和测活完成后一次性切换。
 
-During batch health checks, RotatorProxy sends an HTTP/HTTPS request to `health_check_url` through each candidate node, similar to Clash-style URL delay testing rather than ICMP ping. HTTPS health checks verify certificates by default; set `health_check_tls_skip_verify = true` only for private/self-signed check endpoints. A node that fails all configured attempts is not admitted to the active rotation pool. During normal traffic, if an admitted node fails connection setup repeatedly, it enters cooldown and is skipped until the cooldown expires.
+批量测活时，RotatorProxy 会通过每个候选节点向 `health_check_url` 发起 HTTP/HTTPS 请求，类似 Clash 的 URL delay 测试，而不是 ICMP ping。HTTPS 测活默认校验证书；只有私有或自签测活端点才建议设置 `health_check_tls_skip_verify = true`。节点如果在配置次数内全部测活失败，就不会进入活动轮换池。正常转发流量时，已入池节点如果连续连接失败，会进入冷却并在冷却结束前被跳过。
 
-For Mihomo-backed fallback nodes, a new sidecar generation is started before health checks. If at least one of its nodes passes, that generation is activated and the old generation is retired after `mihomo_retire_grace_seconds`. If none pass, the new generation is discarded and no failed nodes enter rotation.
+对于 Mihomo-backed fallback 节点，新 sidecar generation 会在测活前启动。如果其中至少一个节点测活通过，该 generation 会被激活，旧 generation 会在 `mihomo_retire_grace_seconds` 后退出。如果没有节点通过，新 generation 会被丢弃，失败节点不会进入轮换。
 
-Logs include source reloads, subscription fetch failures, health-check admission/rejection, pool swaps, runtime failures, and cooldown transitions.
+日志会覆盖来源加载、订阅获取失败、健康检查准入/拒绝、代理池切换、运行时失败和冷却状态变化。
 
-## Current Scope
+## 当前范围
 
-RotatorProxy is a TCP proxy rotator. It does not implement UDP associate or a Clash rules engine in its own process. Complex TCP protocols are handled by the embedded backend where supported; fallback-only Clash protocols require explicit Mihomo enablement. Unknown non-Clash line formats are skipped with a warning.
+RotatorProxy 是 TCP 代理轮换器。它不在自身进程中实现 UDP associate，也不实现 Clash 规则引擎。复杂 TCP 协议会在受支持时由内嵌后端处理；只有 fallback 才能支持的 Clash 协议需要显式启用 Mihomo。未知的非 Clash 行格式会记录警告并跳过。
 
-Health checks support `http://` and `https://` URLs.
+健康检查支持 `http://` 和 `https://` URL。
 
-For plain HTTP proxy requests, RotatorProxy rewrites the first absolute-form request line to origin-form and then tunnels the connection. `CONNECT` is the preferred mode for HTTPS traffic.
+对于普通 HTTP 代理请求，RotatorProxy 会把第一行 absolute-form 请求改写为 origin-form，然后继续转发连接。HTTPS 流量建议使用 `CONNECT` 模式。
 
-## Development
+## 开发
 
 ```bash
 cargo fmt --check
@@ -150,17 +150,17 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The integration tests cover:
+集成测试覆盖：
 
-- HTTP absolute-form forwarding.
-- HTTP `CONNECT` forwarding.
-- SOCKS5 inbound forwarding.
-- Retry from a failed outbound proxy to the next proxy.
-- Batch health refresh filtering and active-pool swap.
-- HTTPS health checks with explicit certificate-verification bypass.
-- Parser coverage for native Clash nodes, complex Clash nodes, and common complex URI links.
-- Mihomo generation config rendering without starting a real Mihomo process.
+- HTTP absolute-form 转发。
+- HTTP `CONNECT` 转发。
+- SOCKS5 入站转发。
+- 第一个出站代理失败时重试下一个代理。
+- 批量健康刷新过滤失败代理并切换活动代理池。
+- HTTPS 健康检查显式跳过证书校验。
+- 原生 Clash 节点、复杂 Clash 节点和常见复杂 URI 链接的解析覆盖。
+- 不启动真实 Mihomo 进程的 generation 配置渲染。
 
-## License
+## 许可证
 
-RotatorProxy is licensed as GPL-3.0-only. Copyright (C) 2026 Null <pylindex@qq.com>.
+RotatorProxy 使用 GPL-3.0-only 许可证。Copyright (C) 2026 Null <pylindex@qq.com>.
