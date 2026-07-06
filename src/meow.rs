@@ -18,6 +18,7 @@ use meow_transport::{
     tls::{RealityConfig, TlsConfig, TlsLayer},
     ws::{WsConfig, WsLayer},
 };
+use rustls::pki_types::ServerName;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -42,7 +43,7 @@ pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
                 nodes.push(node);
             }
             Err(err) => {
-                warn!(
+                debug!(
                     node = %proxy.name,
                     kind = %proxy.kind,
                     "complex proxy is not supported by native meow backend; trying mihomo fallback: {err:#}"
@@ -50,6 +51,13 @@ pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
                 fallback.push(proxy);
             }
         }
+    }
+
+    if !fallback.is_empty() {
+        warn!(
+            fallback_nodes = fallback.len(),
+            "complex proxies require mihomo fallback or will be skipped if mihomo is disabled; enable debug logs for per-node reasons"
+        );
     }
 
     MeowBuildResult { nodes, fallback }
@@ -147,6 +155,7 @@ fn build_trojan(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Res
     }
     let password = required_string(mapping, &["password"], &name)?;
     let sni = string_field(mapping, &["sni", "servername"]).unwrap_or_else(|| server.clone());
+    validate_tls_server_name(&sni)?;
     let adapter = TrojanAdapter::new(
         &name,
         &server,
@@ -291,13 +300,14 @@ fn build_transport_chain(
         "" | "tcp" | "vmess" | "vless" => {}
         "ws" | "websocket" => {
             let options = mapping_field(mapping, "ws-opts");
+            let host_header = string_field_in(options, &["host"])
+                .or_else(|| header_field(options, "Host"))
+                .or_else(|| string_field(mapping, &["host"]))
+                .or_else(|| Some(server.to_owned()));
             let config = WsConfig {
                 path: string_field_in(options, &["path"]).unwrap_or_else(|| "/".to_owned()),
-                host_header: string_field_in(options, &["host"])
-                    .or_else(|| header_field(options, "Host"))
-                    .or_else(|| string_field(mapping, &["host"]))
-                    .or_else(|| Some(server.to_owned())),
-                extra_headers: headers_from_mapping(options),
+                host_header,
+                extra_headers: headers_from_mapping_without(options, &["host"]),
                 max_early_data: usize_field_in(options, &["max-early-data"]).unwrap_or(0),
                 early_data_header_name: string_field_in(options, &["early-data-header-name"]),
             };
@@ -334,7 +344,7 @@ fn build_transport_chain(
                 path: string_field_in(options, &["path"]).unwrap_or_else(|| "/".to_owned()),
                 host_header: string_field_in(options, &["host"])
                     .or_else(|| Some(server.to_owned())),
-                extra_headers: headers_from_mapping(options),
+                extra_headers: headers_from_mapping_without(options, &["host"]),
             };
             chain.push(Box::new(HttpUpgradeLayer::new(config)));
         }
@@ -380,6 +390,12 @@ fn uuid_bytes(value: &str) -> Result<[u8; 16]> {
     Ok(*Uuid::parse_str(value)
         .with_context(|| format!("invalid uuid {value}"))?
         .as_bytes())
+}
+
+fn validate_tls_server_name(value: &str) -> Result<()> {
+    ServerName::try_from(value.to_owned())
+        .with_context(|| format!("invalid TLS server name/SNI {value}"))?;
+    Ok(())
 }
 
 fn parse_hy2_hop_interval(mapping: &serde_yaml::Mapping) -> Option<Hy2HopInterval> {
@@ -522,13 +538,25 @@ fn header_field(mapping: Option<&serde_yaml::Mapping>, key: &str) -> Option<Stri
     string_field_in(Some(headers), &[key])
 }
 
-fn headers_from_mapping(mapping: Option<&serde_yaml::Mapping>) -> Vec<(String, String)> {
+fn headers_from_mapping_without(
+    mapping: Option<&serde_yaml::Mapping>,
+    excluded_keys: &[&str],
+) -> Vec<(String, String)> {
     let Some(headers) = mapping.and_then(|mapping| mapping_field(mapping, "headers")) else {
         return Vec::new();
     };
     headers
         .iter()
-        .filter_map(|(key, value)| Some((value_to_string(key)?, value_to_string(value)?)))
+        .filter_map(|(key, value)| {
+            let key = value_to_string(key)?;
+            if excluded_keys
+                .iter()
+                .any(|excluded| key.eq_ignore_ascii_case(excluded))
+            {
+                return None;
+            }
+            Some((key, value_to_string(value)?))
+        })
         .collect()
 }
 
@@ -703,5 +731,36 @@ reality-opts:
         let result = build_meow_nodes(vec![proxy]);
         assert_eq!(result.nodes.len(), 0);
         assert_eq!(result.fallback.len(), 1);
+    }
+
+    #[test]
+    fn invalid_trojan_sni_falls_back_without_panic() {
+        let proxy = complex(
+            r#"
+name: trojan-invalid-sni
+type: trojan
+server: example.com
+port: 443
+password: pass
+sni: t.me%2Fripaojiedian
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 0);
+        assert_eq!(result.fallback.len(), 1);
+    }
+
+    #[test]
+    fn host_header_is_removed_from_extra_headers() {
+        let options: serde_yaml::Mapping = serde_yaml::from_str(
+            r#"
+headers:
+  Host: cdn.example.com
+  X-Test: ok
+"#,
+        )
+        .unwrap();
+        let headers = headers_from_mapping_without(Some(&options), &["host"]);
+        assert_eq!(headers, vec![("X-Test".to_owned(), "ok".to_owned())]);
     }
 }
