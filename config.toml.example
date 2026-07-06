@@ -81,17 +81,23 @@ mihomo_enabled = false
 # platforms should provide a binary through mihomo_binary or PATH.
 mihomo_auto_download = false
 
-# Work directory for downloaded Mihomo binaries and generated generation configs.
+# Work directory for downloaded Mihomo binaries and generated batch configs.
 # This path is runtime state and is ignored by Git in the default repository.
 mihomo_work_dir = ".rotator-proxy/mihomo"
 
 # Log level written into generated Mihomo configs.
 mihomo_log_level = "warning"
 
-# Maximum time to wait for a newly spawned Mihomo generation to open all local
+# Maximum fallback nodes placed into one Mihomo process. RotatorProxy will
+# shrink the current batch and retry if reserving local ports hits
+# "Too many open files"; lower this if your system has a small per-process file
+# descriptor limit.
+mihomo_generation_batch_size = 256
+
+# Maximum time to wait for a newly spawned Mihomo batch to open all local
 # listeners before its nodes are skipped for that refresh.
 mihomo_startup_timeout_ms = 10000
 
 # After a successful refresh swaps in a new pool, keep the previous Mihomo
-# generation alive for this long so existing connections can drain.
+# batch alive for this long so existing connections can drain.
 mihomo_retire_grace_seconds = 300

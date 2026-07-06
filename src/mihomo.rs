@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt,
     fs::File,
     io,
@@ -43,7 +44,7 @@ pub struct MihomoManager {
 }
 
 struct MihomoManagerInner {
-    current: Mutex<Option<MihomoGeneration>>,
+    current: Mutex<Vec<MihomoGeneration>>,
     next_generation: AtomicU64,
 }
 
@@ -63,7 +64,7 @@ impl MihomoManager {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(MihomoManagerInner {
-                current: Mutex::new(None),
+                current: Mutex::new(Vec::new()),
                 next_generation: AtomicU64::new(1),
             }),
         }
@@ -86,6 +87,59 @@ impl MihomoManager {
         }
 
         let binary = ensure_mihomo_binary(config).await?;
+        let configured_batch_size = config.mihomo_generation_batch_size.max(1);
+        let planned_batch_count =
+            mihomo_generation_batch_count(proxies.len(), configured_batch_size);
+        let mut active_batch_size = configured_batch_size;
+        let mut generations = Vec::with_capacity(planned_batch_count);
+        let mut nodes = Vec::with_capacity(proxies.len());
+        let mut offset = 0;
+        let mut batch_index = 0;
+        while offset < proxies.len() {
+            let end = (offset + active_batch_size).min(proxies.len());
+            let batch = &proxies[offset..end];
+            let reserved_ports = match reserve_local_ports(batch.len()) {
+                Ok(listeners) => listeners,
+                Err(err) if batch.len() > 1 && is_too_many_open_files(&err) => {
+                    active_batch_size = (batch.len() / 2).max(1);
+                    warn!(
+                        requested_nodes = batch.len(),
+                        retry_batch_size = active_batch_size,
+                        "预留 Mihomo 本地监听端口失败，已自动缩小批次后重试：{err}"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("预留 {} 个本地 Mihomo 监听端口失败", batch.len())
+                    });
+                }
+            };
+            let prepared = self
+                .prepare_generation_batch(config, &binary, batch, reserved_ports, batch_index)
+                .await?;
+            nodes.extend(prepared.nodes);
+            generations.push(prepared.generation);
+            offset = end;
+            batch_index += 1;
+        }
+        info!(
+            generations = generations.len(),
+            nodes = nodes.len(),
+            configured_batch_size,
+            "Mihomo 批次全部准备就绪"
+        );
+        Ok(Some(MihomoPreparedGeneration { generations, nodes }))
+    }
+
+    async fn prepare_generation_batch(
+        &self,
+        config: &AppConfig,
+        binary: &Path,
+        proxies: &[MihomoProxyConfig],
+        reserved_ports: Vec<StdTcpListener>,
+        batch_index: usize,
+    ) -> Result<PreparedBatch> {
         let generation_id = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
         let generation_dir = config
             .mihomo_work_dir
@@ -95,23 +149,22 @@ impl MihomoManager {
             .await
             .with_context(|| format!("创建目录失败：{}", generation_dir.display()))?;
 
-        let reserved_ports = reserve_local_ports(proxies.len())?;
         let ports = reserved_ports
             .iter()
             .map(|listener| listener.local_addr().map(|addr| addr.port()))
             .collect::<io::Result<Vec<_>>>()
             .context("读取已预留的 Mihomo 监听端口失败")?;
         let generated =
-            build_generation_config(generation_id, &proxies, &ports, &config.mihomo_log_level)?;
+            build_generation_config(generation_id, proxies, &ports, &config.mihomo_log_level)?;
         let config_path = generation_dir.join("config.yaml");
-        let yaml = serde_yaml::to_string(&generated.config)
-            .context("序列化 Mihomo generation 配置失败")?;
+        let yaml =
+            serde_yaml::to_string(&generated.config).context("序列化 Mihomo 批次配置失败")?;
         tokio::fs::write(&config_path, yaml)
             .await
             .with_context(|| format!("写入配置失败：{}", config_path.display()))?;
         drop(reserved_ports);
 
-        let mut child = spawn_mihomo(&binary, &config_path, &generation_dir, generation_id)
+        let mut child = spawn_mihomo(binary, &config_path, &generation_dir, generation_id)
             .await
             .with_context(|| format!("启动 Mihomo 失败：{}", binary.display()))?;
         wait_for_listeners(
@@ -124,9 +177,10 @@ impl MihomoManager {
         info!(
             generation = generation_id,
             nodes = generated.nodes.len(),
-            "Mihomo generation 已准备就绪"
+            batch = batch_index + 1,
+            "Mihomo 批次已准备就绪"
         );
-        Ok(Some(MihomoPreparedGeneration {
+        Ok(PreparedBatch {
             generation: MihomoGeneration {
                 id: generation_id,
                 child,
@@ -134,50 +188,71 @@ impl MihomoManager {
                 node_count: generated.nodes.len(),
             },
             nodes: generated.nodes,
-        }))
+        })
     }
 
-    pub async fn activate(&self, generation: MihomoGeneration, retire_grace: Duration) {
-        let id = generation.id;
-        let node_count = generation.node_count;
+    pub async fn activate(&self, generations: Vec<MihomoGeneration>, retire_grace: Duration) {
+        let generation_count = generations.len();
+        let node_count = generations
+            .iter()
+            .map(|generation| generation.node_count)
+            .sum::<usize>();
         let old = {
             let mut guard = self.inner.current.lock().await;
-            guard.replace(generation)
+            std::mem::replace(&mut *guard, generations)
         };
         info!(
-            generation = id,
+            generations = generation_count,
             nodes = node_count,
-            "Mihomo generation 已激活"
+            "Mihomo 批次已激活"
         );
-        retire_old_generation(old, retire_grace);
+        retire_old_generations(old, retire_grace);
     }
 
     pub async fn deactivate(&self, retire_grace: Duration) {
         let old = {
             let mut guard = self.inner.current.lock().await;
-            guard.take()
+            std::mem::take(&mut *guard)
         };
-        retire_old_generation(old, retire_grace);
+        retire_old_generations(old, retire_grace);
     }
 }
 
 pub struct MihomoPreparedGeneration {
-    generation: MihomoGeneration,
+    generations: Vec<MihomoGeneration>,
     nodes: Vec<ProxyNode>,
 }
 
 impl MihomoPreparedGeneration {
-    pub fn generation_id(&self) -> u64 {
-        self.generation.id
-    }
-
     pub fn nodes(&self) -> &[ProxyNode] {
         &self.nodes
     }
 
-    pub fn into_generation(self) -> MihomoGeneration {
-        self.generation
+    pub fn split_active_generations(
+        self,
+        active_generation_ids: &HashSet<u64>,
+    ) -> MihomoSplitGenerations {
+        let mut active = Vec::new();
+        let mut inactive = Vec::new();
+        for generation in self.generations {
+            if active_generation_ids.contains(&generation.id) {
+                active.push(generation);
+            } else {
+                inactive.push(generation);
+            }
+        }
+        MihomoSplitGenerations { active, inactive }
     }
+}
+
+pub struct MihomoSplitGenerations {
+    pub active: Vec<MihomoGeneration>,
+    pub inactive: Vec<MihomoGeneration>,
+}
+
+struct PreparedBatch {
+    generation: MihomoGeneration,
+    nodes: Vec<ProxyNode>,
 }
 
 pub struct MihomoGeneration {
@@ -261,6 +336,14 @@ fn build_generation_config(
         config: serde_yaml::Value::Mapping(root),
         nodes,
     })
+}
+
+fn mihomo_generation_batch_count(nodes: usize, batch_size: usize) -> usize {
+    if nodes == 0 {
+        0
+    } else {
+        nodes.div_ceil(batch_size.max(1))
+    }
 }
 
 fn insert_yaml(
@@ -368,14 +451,17 @@ async fn wait_for_listeners(
     }
 }
 
-fn reserve_local_ports(count: usize) -> Result<Vec<StdTcpListener>> {
+fn reserve_local_ports(count: usize) -> io::Result<Vec<StdTcpListener>> {
     let mut listeners = Vec::with_capacity(count);
     for _ in 0..count {
-        let listener =
-            StdTcpListener::bind((LOCAL_LISTEN_HOST, 0)).context("预留本地 Mihomo 监听端口失败")?;
+        let listener = StdTcpListener::bind((LOCAL_LISTEN_HOST, 0))?;
         listeners.push(listener);
     }
     Ok(listeners)
+}
+
+fn is_too_many_open_files(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(24) || err.to_string().contains("Too many open files")
 }
 
 async fn ensure_mihomo_binary(config: &AppConfig) -> Result<PathBuf> {
@@ -537,34 +623,35 @@ fn select_linux_asset<'a>(release: &'a GithubRelease, arch: &str) -> Option<&'a 
         })
 }
 
-fn retire_old_generation(generation: Option<MihomoGeneration>, retire_grace: Duration) {
-    let Some(generation) = generation else {
+fn retire_old_generations(generations: Vec<MihomoGeneration>, retire_grace: Duration) {
+    if generations.is_empty() {
         return;
-    };
+    }
     tokio::spawn(async move {
-        let id = generation.id;
         info!(
-            generation = id,
+            generations = generations.len(),
             grace_seconds = retire_grace.as_secs(),
-            "Mihomo generation 已计划延迟退出"
+            "Mihomo 批次已计划延迟退出"
         );
         sleep(retire_grace).await;
-        retire_generation_now(generation).await;
+        for generation in generations {
+            retire_generation_now(generation).await;
+        }
     });
 }
 
 async fn retire_generation_now(mut generation: MihomoGeneration) {
     let id = generation.id;
     match generation.child.try_wait() {
-        Ok(Some(status)) => debug!(generation = id, %status, "Mihomo generation 已经退出"),
+        Ok(Some(status)) => debug!(generation = id, %status, "Mihomo 批次已经退出"),
         Ok(None) => {
             if let Err(err) = generation.child.kill().await {
-                warn!(generation = id, "终止 Mihomo generation 失败：{err}");
+                warn!(generation = id, "终止 Mihomo 批次失败：{err}");
             }
             let _ = generation.child.wait().await;
-            info!(generation = id, "Mihomo generation 已退出");
+            info!(generation = id, "Mihomo 批次已退出");
         }
-        Err(err) => warn!(generation = id, "检查 Mihomo generation 状态失败：{err}"),
+        Err(err) => warn!(generation = id, "检查 Mihomo 批次状态失败：{err}"),
     }
     if let Err(err) = tokio::fs::remove_dir_all(&generation.work_dir).await
         && err.kind() != io::ErrorKind::NotFound
@@ -572,9 +659,13 @@ async fn retire_generation_now(mut generation: MihomoGeneration) {
         warn!(
             generation = id,
             path = %generation.work_dir.display(),
-            "删除 Mihomo generation 目录失败：{err}"
+            "删除 Mihomo 批次目录失败：{err}"
         );
     }
+}
+
+pub fn retire_unused_generations(generations: Vec<MihomoGeneration>) {
+    retire_old_generations(generations, Duration::ZERO);
 }
 
 #[cfg(test)]
@@ -619,6 +710,15 @@ uuid: 00000000-0000-0000-0000-000000000000
         assert_eq!(generated.nodes.len(), 2);
         assert_eq!(generated.nodes[0].label(), "mihomo:vmess:vmess-a");
         assert_eq!(generated.nodes[1].mihomo_generation(), Some(7));
+    }
+
+    #[test]
+    fn counts_mihomo_generation_batches() {
+        assert_eq!(mihomo_generation_batch_count(0, 256), 0);
+        assert_eq!(mihomo_generation_batch_count(1, 256), 1);
+        assert_eq!(mihomo_generation_batch_count(256, 256), 1);
+        assert_eq!(mihomo_generation_batch_count(257, 256), 2);
+        assert_eq!(mihomo_generation_batch_count(10, 0), 10);
     }
 
     #[test]

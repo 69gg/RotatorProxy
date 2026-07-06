@@ -31,6 +31,7 @@ const DEFAULT_MIHOMO_WORK_DIR: &str = ".rotator-proxy/mihomo";
 const DEFAULT_MIHOMO_LOG_LEVEL: &str = "warning";
 const DEFAULT_MIHOMO_STARTUP_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MIHOMO_RETIRE_GRACE_SECONDS: u64 = 300;
+const DEFAULT_MIHOMO_GENERATION_BATCH_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -59,6 +60,7 @@ pub struct AppConfig {
     pub mihomo_log_level: String,
     pub mihomo_startup_timeout_ms: u64,
     pub mihomo_retire_grace_seconds: u64,
+    pub mihomo_generation_batch_size: usize,
 }
 
 impl Default for AppConfig {
@@ -88,6 +90,7 @@ impl Default for AppConfig {
             mihomo_log_level: DEFAULT_MIHOMO_LOG_LEVEL.to_owned(),
             mihomo_startup_timeout_ms: DEFAULT_MIHOMO_STARTUP_TIMEOUT_MS,
             mihomo_retire_grace_seconds: DEFAULT_MIHOMO_RETIRE_GRACE_SECONDS,
+            mihomo_generation_batch_size: DEFAULT_MIHOMO_GENERATION_BATCH_SIZE,
         }
     }
 }
@@ -161,6 +164,9 @@ impl AppConfig {
             }
             if self.mihomo_retire_grace_seconds == 0 {
                 bail!("mihomo_retire_grace_seconds 必须大于 0");
+            }
+            if self.mihomo_generation_batch_size == 0 {
+                bail!("mihomo_generation_batch_size 必须大于 0");
             }
         }
         Ok(())
@@ -286,6 +292,10 @@ proxy_dirs = ["./fixtures"]
             config.mihomo_startup_timeout_ms,
             DEFAULT_MIHOMO_STARTUP_TIMEOUT_MS
         );
+        assert_eq!(
+            config.mihomo_generation_batch_size,
+            DEFAULT_MIHOMO_GENERATION_BATCH_SIZE
+        );
         assert_eq!(config.proxy_dirs, vec![PathBuf::from("./fixtures")]);
         config.validate().unwrap();
     }
@@ -366,6 +376,16 @@ proxy_dirs = ["./fixtures"]
         let config = AppConfig {
             mihomo_enabled: true,
             mihomo_startup_timeout_ms: 0,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_mihomo_generation_batch_size() {
+        let config = AppConfig {
+            mihomo_enabled: true,
+            mihomo_generation_batch_size: 0,
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());

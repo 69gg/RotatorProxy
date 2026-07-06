@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt, io,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -24,7 +25,7 @@ use crate::{
     config::{AppConfig, StatusRange, parse_health_check_expected_status},
     load_proxies_from_dirs,
     meow::build_meow_nodes,
-    mihomo::{MihomoManager, MihomoPreparedGeneration},
+    mihomo::{MihomoManager, MihomoPreparedGeneration, retire_unused_generations},
     outbound::connect_via_proxy_node,
     proxy::{ProxyNode, ProxyPool, TargetAddr},
 };
@@ -302,19 +303,18 @@ async fn apply_mihomo_generation(
         }
         return;
     };
-    let generation = prepared.generation_id();
-    let active_generation = active
+    let active_generation_ids = active
         .iter()
-        .any(|proxy| proxy.mihomo_generation() == Some(generation));
-    if active_generation {
+        .filter_map(ProxyNode::mihomo_generation)
+        .collect::<HashSet<_>>();
+    let split_generations = prepared.split_active_generations(&active_generation_ids);
+    retire_unused_generations(split_generations.inactive);
+    if !split_generations.active.is_empty() {
         mihomo
-            .activate(prepared.into_generation(), retire_grace)
+            .activate(split_generations.active, retire_grace)
             .await;
     } else {
-        warn!(
-            generation,
-            "所有 Mihomo 承载节点健康检查均失败，本次 generation 不会激活"
-        );
+        warn!("所有 Mihomo 承载节点健康检查均失败，本次 Mihomo 批次不会激活");
         mihomo.deactivate(retire_grace).await;
     }
 }

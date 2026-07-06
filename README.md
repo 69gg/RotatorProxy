@@ -53,8 +53,9 @@ cargo run --release -- --config config.toml
 - `mihomo_binary`：可选的 Mihomo 可执行文件路径。未设置时会依次在 `PATH` 中查找 `mihomo`、`clash-meta`、`clash`。
 - `mihomo_auto_download`：与 `mihomo_enabled` 同时启用时，Linux amd64/arm64 主机可自动下载最新 Mihomo release。
 - `mihomo_work_dir`：下载的二进制和生成的 sidecar 配置所在运行目录。
-- `mihomo_startup_timeout_ms`：等待新 Mihomo generation 打开本地监听端口的最长时间。
-- `mihomo_retire_grace_seconds`：代理池切换后，旧 Mihomo generation 延迟退出的时间。
+- `mihomo_generation_batch_size`：每个 Mihomo sidecar 进程最多承载多少个 fallback 节点，默认 `256`，用于避免单进程打开过多本地监听器触发 `Too many open files`。
+- `mihomo_startup_timeout_ms`：等待新 Mihomo 批次打开本地监听端口的最长时间。
+- `mihomo_retire_grace_seconds`：代理池切换后，旧 Mihomo 批次延迟退出的时间。
 
 `config.toml` 和 `.rotator-proxy/` 会被 Git 忽略。
 
@@ -125,7 +126,7 @@ Reality 和真实 uTLS/client-fingerprint 支持使用 `meow-transport` 的 Bori
 
 当节点使用内嵌后端无法可靠复现的字段或协议时，例如 TUIC、WireGuard/WG、Mieru、SSH 或 SSR，该节点会进入可选 Mihomo fallback 队列。Mihomo fallback 默认关闭。在默认配置下，只有 fallback 才能支持的节点会被记录日志并跳过，不会启动或下载外部可执行文件。
 
-如果设置 `mihomo_enabled = true`，RotatorProxy 会为每个 fallback 节点生成一个本地 Mihomo `mixed` 监听器，绑定到 `127.0.0.1`，并把该监听器的 `proxy` 字段固定到一个内部代理名。轮换器随后把这个监听器当作普通出站候选节点处理。这样可以避免全局 selector 切换，并让并发请求稳定绑定到轮换器选择的节点。
+如果设置 `mihomo_enabled = true`，RotatorProxy 会为每个 fallback 节点生成一个本地 Mihomo `mixed` 监听器，绑定到 `127.0.0.1`，并把该监听器的 `proxy` 字段固定到一个内部代理名。轮换器随后把这个监听器当作普通出站候选节点处理。这样可以避免全局 selector 切换，并让并发请求稳定绑定到轮换器选择的节点。fallback 节点会按 `mihomo_generation_batch_size` 拆成多个 Mihomo 进程，避免一次在单个进程里打开几千个监听器。如果预留本地监听端口时遇到 `Too many open files`，当前刷新会自动缩小 Mihomo 批次并重试；仍然失败时，可以降低 `mihomo_generation_batch_size` 或调高 `ulimit -n`。
 
 在 Linux `x86_64` 和 `aarch64` 上，当同时启用 `mihomo_enabled` 和 `mihomo_auto_download` 时，RotatorProxy 可以自动下载最新 Mihomo gzip release 中的 `amd64` 或 `arm64` 资源。其他平台，或需要固定二进制来源时，请自行安装 Mihomo，并设置 `mihomo_binary` 或放入 `PATH`。
 
@@ -137,7 +138,7 @@ RotatorProxy 不会监控输入目录变化。它只会在启动时和配置的�
 
 启动阶段如果没有任何健康节点，会按空活动池启动。定时刷新阶段如果新一轮测活没有任何健康节点，RotatorProxy 会保留上一版活动池继续服务，避免公开源短时波动把可用池清空。
 
-对于 Mihomo-backed fallback 节点，新 sidecar generation 会在测活前启动。如果其中至少一个节点测活通过，该 generation 会被激活，旧 generation 会在 `mihomo_retire_grace_seconds` 后退出。如果没有节点通过，新 generation 会被丢弃，失败节点不会进入轮换。
+对于 Mihomo-backed fallback 节点，新 sidecar 批次会在测活前启动。如果其中至少一个节点测活通过，该批次会被激活，旧批次会在 `mihomo_retire_grace_seconds` 后退出。如果没有节点通过，新批次会被清理，失败节点不会进入轮换。
 
 日志会覆盖来源加载、订阅获取失败、解析异常汇总、健康检查开始/完成总结、代理池切换、运行时失败和冷却状态变化。RotatorProxy 自身日志使用中文；依赖库或可选 Mihomo sidecar 的日志会按其原始内容输出。逐行解析失败明细默认在 debug 日志中输出，避免大型公开源刷屏。
 
@@ -168,7 +169,7 @@ cargo test
 - HTTPS 健康检查显式跳过证书校验。
 - 原生 Clash 节点、复杂 Clash 节点、HTTPS 代理和常见复杂 URI 链接的解析覆盖。
 - HTTPS 出站代理可参与批量健康检查。
-- 不启动真实 Mihomo 进程的 generation 配置渲染。
+- 不启动真实 Mihomo 进程的批次配置渲染。
 
 ## 许可证
 
