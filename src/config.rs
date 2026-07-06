@@ -17,7 +17,7 @@ const SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES: &[&str] =
     &["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_HEALTH_CHECK_URL: &str = "http://cp.cloudflare.com/generate_204";
-const DEFAULT_HEALTH_CHECK_EXPECTED_STATUS: &str = "204";
+const DEFAULT_HEALTH_CHECK_EXPECTED_STATUS: &str = "200-399";
 const DEFAULT_HEALTH_CHECK_ATTEMPTS: usize = 3;
 const DEFAULT_HEALTH_CHECK_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_HEALTH_CHECK_CONCURRENCY: usize = 256;
@@ -277,7 +277,7 @@ proxy_dirs = ["./fixtures"]
             config.health_check_url,
             "http://cp.cloudflare.com/generate_204"
         );
-        assert_eq!(config.health_check_expected_status, "204");
+        assert_eq!(config.health_check_expected_status, "200-399");
         assert_eq!(config.health_check_attempts, DEFAULT_HEALTH_CHECK_ATTEMPTS);
         assert!(config.subscription_proxy.is_none());
         assert!(!config.mihomo_enabled);

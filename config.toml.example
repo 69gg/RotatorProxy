@@ -37,8 +37,8 @@ log_level = "info"
 health_check_url = "http://cp.cloudflare.com/generate_204"
 
 # Expected HTTP status for a successful health check. Supports exact codes and
-# comma-separated ranges, for example "204" or "200-299, 204".
-health_check_expected_status = "204"
+# comma-separated ranges. Use "204" for strict generate_204 checks.
+health_check_expected_status = "200-399"
 
 # A node must pass within this many attempts to enter the active rotation pool.
 health_check_attempts = 3

@@ -42,7 +42,7 @@ cargo run --release -- --config config.toml
 - `subscription_proxy`：可选代理 URL，只用于获取订阅/Clash 配置 URL 和自动下载 Mihomo。支持 `http`、`https`、`socks4`、`socks4a`、`socks5`、`socks5h`。
 - `log_level`：默认日志级别。`RUST_LOG` 会覆盖该值。
 - `health_check_url`：用于节点测活的 HTTP 或 HTTPS URL，默认 `http://cp.cloudflare.com/generate_204`。
-- `health_check_expected_status`：测活成功期望状态码，默认 `204`。支持精确值和逗号分隔范围，例如 `204` 或 `200-299`。
+- `health_check_expected_status`：测活成功期望状态码，默认 `200-399`。支持精确值和逗号分隔范围；如果想严格检测 `generate_204`，可以设为 `204`。
 - `health_check_attempts`：节点被排除出活动代理池前的测活尝试次数。
 - `health_check_concurrency`：批量测活时的最大并发数。节点很多时建议设置为 `128` 到 `512`。
 - `health_check_tls_skip_verify`：显式设为 `true` 时跳过 HTTPS 测活证书校验，默认 `false`。
