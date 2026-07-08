@@ -281,9 +281,10 @@ fn parse_local_content(
         });
     }
 
-    if let Some(proxies) = parse_clash_yaml(content, source)? {
+    if let Some(parsed) = parse_clash_yaml_document(content, source)? {
         return Ok(LocalParseResult {
-            proxies,
+            proxies: parsed.proxies,
+            subscription_urls: parsed.provider_urls,
             ..LocalParseResult::default()
         });
     }
@@ -672,10 +673,12 @@ fn parse_anytls_url(url: &Url) -> Result<MihomoProxyConfig> {
     let name = proxy_name_from_url(url, "anytls");
     let server = required_host(url, "anytls")?;
     let port = url.port().unwrap_or(8443);
-    let password = url
-        .password()
-        .map(decode_url_component)
-        .or_else(|| query_param(url, "password"))
+    let password = query_param(url, "password")
+        .or_else(|| url.password().map(decode_url_component))
+        .or_else(|| {
+            let username = decode_url_component(url.username());
+            (!username.is_empty()).then_some(username)
+        })
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("anytls 链接缺少 password"))?;
 
@@ -873,13 +876,24 @@ fn looks_like_base64(value: &str) -> bool {
     })
 }
 
+struct ClashYamlParse {
+    proxies: LoadedProxySet,
+    provider_urls: Vec<String>,
+}
+
+#[cfg(test)]
 fn parse_clash_yaml(content: &str, source: &str) -> Result<Option<LoadedProxySet>> {
+    Ok(parse_clash_yaml_document(content, source)?.map(|parsed| parsed.proxies))
+}
+
+fn parse_clash_yaml_document(content: &str, source: &str) -> Result<Option<ClashYamlParse>> {
     let yaml_value = match serde_yaml::from_str::<serde_yaml::Value>(content) {
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
     let raw_entries = raw_clash_proxy_values(&yaml_value);
-    if raw_entries.is_empty() {
+    let provider_urls = clash_proxy_provider_urls(&yaml_value);
+    if raw_entries.is_empty() && provider_urls.is_empty() {
         return Ok(None);
     }
 
@@ -904,7 +918,10 @@ fn parse_clash_yaml(content: &str, source: &str) -> Result<Option<LoadedProxySet
             Err(err) => warn!("来源 {source} 中存在无效 Clash 代理：{err}"),
         }
     }
-    Ok(Some(proxies))
+    Ok(Some(ClashYamlParse {
+        proxies,
+        provider_urls,
+    }))
 }
 
 fn raw_clash_proxy_values(root: &serde_yaml::Value) -> Vec<serde_yaml::Value> {
@@ -912,6 +929,27 @@ fn raw_clash_proxy_values(root: &serde_yaml::Value) -> Vec<serde_yaml::Value> {
         .and_then(serde_yaml::Value::as_sequence)
         .cloned()
         .unwrap_or_default()
+}
+
+fn clash_proxy_provider_urls(root: &serde_yaml::Value) -> Vec<String> {
+    let Some(providers) = root
+        .get("proxy-providers")
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return Vec::new();
+    };
+
+    providers
+        .values()
+        .filter_map(|provider| {
+            provider
+                .get("url")
+                .and_then(serde_yaml::Value::as_str)
+                .map(str::trim)
+                .filter(|url| !url.is_empty() && is_subscription_url(url))
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 enum ClashProxyDecision {
@@ -1595,6 +1633,38 @@ http://127.0.0.1:8080 # inline comment
         Ok(())
     }
 
+    #[tokio::test]
+    async fn clash_proxy_provider_urls_are_expanded() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source_path = dir.path().join("clash.yaml");
+        let (provider_url, first_line_rx, _handle) =
+            spawn_subscription_proxy("http://127.0.0.1:8080\n").await?;
+        fs::write(
+            &source_path,
+            format!(
+                r#"
+proxy-providers:
+  provider-a:
+    type: http
+    url: {provider_url}
+    path: ./provider.yaml
+    interval: 3600
+"#
+            ),
+        )?;
+        let options = SubscriptionOptions {
+            timeout: Duration::from_secs(2),
+            user_agent: "RotatorProxyTest/0.1".to_owned(),
+            proxy: None,
+        };
+
+        let proxies = load_proxies_from_paths(&[source_path], &options).await?;
+
+        assert_eq!(proxies.native.len(), 1);
+        assert_eq!(first_line_rx.await.unwrap(), "GET / HTTP/1.1");
+        Ok(())
+    }
+
     #[test]
     fn parses_clash_yaml_nodes() {
         let yaml = r#"
@@ -1742,6 +1812,23 @@ proxies:
                 let text = serde_yaml::to_string(&proxy.value).unwrap();
                 assert!(text.contains("password: pass"));
                 assert!(text.contains("sni: tls.example.com"));
+            }
+            ParsedProxyLine::Native(_) => panic!("expected complex node"),
+        }
+    }
+
+    #[test]
+    fn parses_anytls_username_as_password() {
+        let parsed = parse_proxy_line("anytls://pass@example.com:8443#anytls-a")
+            .unwrap()
+            .unwrap();
+
+        match parsed {
+            ParsedProxyLine::Mihomo(proxy) => {
+                assert_eq!(proxy.name, "anytls-a");
+                assert_eq!(proxy.kind, "anytls");
+                let text = serde_yaml::to_string(&proxy.value).unwrap();
+                assert!(text.contains("password: pass"));
             }
             ParsedProxyLine::Native(_) => panic!("expected complex node"),
         }
