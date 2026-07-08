@@ -305,7 +305,13 @@ fn parse_local_content(
             }
             Ok(None) => {
                 issues.unsupported_lines += 1;
-                debug!("不支持的代理来源行 {}:{}：{}", source, index + 1, line);
+                debug!(
+                    reason = classify_unsupported_line(line),
+                    "不支持的代理来源行 {}:{}：{}",
+                    source,
+                    index + 1,
+                    line
+                );
             }
             Err(err) if allow_subscriptions && is_subscription_url(line) => {
                 debug!("代理解析未命中，按订阅 URL 处理该行：{err}");
@@ -345,6 +351,18 @@ fn normalize_source_line(line: &str) -> Option<&str> {
         }
     }
     Some(line)
+}
+
+fn classify_unsupported_line(line: &str) -> &'static str {
+    if looks_like_percent_encoded_subscription_fragment(line) {
+        "疑似订阅残片或节点名，不是代理链接"
+    } else {
+        "未知或暂不支持的代理来源格式"
+    }
+}
+
+fn looks_like_percent_encoded_subscription_fragment(line: &str) -> bool {
+    line.contains("%7C") && !line.contains("://")
 }
 
 enum ParsedProxyLine {
@@ -642,9 +660,6 @@ fn parse_hysteria2_url(url: &Url) -> Result<MihomoProxyConfig> {
             (!username.is_empty()).then_some(username)
         })
         .unwrap_or_default();
-    if password.is_empty() {
-        return Err(anyhow!("hysteria2 链接缺少 password"));
-    }
 
     let mut proxy = ClashProxyDocument::new(name, "hysteria2", server, port);
     proxy.insert_string("password", password);
@@ -1782,6 +1797,16 @@ mod tests {
     }
 
     #[test]
+    fn classifies_percent_encoded_subscription_fragments() {
+        assert_eq!(
+            classify_unsupported_line(
+                "11%7C%E9%A6%99%E6%B8%AF4%7C@ripaojiedian%7CAutoMergePublicNodes_list_txt",
+            ),
+            "疑似订阅残片或节点名，不是代理链接"
+        );
+    }
+
+    #[test]
     fn fetched_proxy_lists_do_not_expand_nested_subscription_urls() {
         let parsed = parse_local_content(
             r#"
@@ -2106,6 +2131,23 @@ proxies:
                 assert_eq!(proxy.kind, "hysteria2");
                 let text = serde_yaml::to_string(&proxy.value).unwrap();
                 assert!(text.contains("port: 443"));
+            }
+            ParsedProxyLine::Native(_) => panic!("expected complex node"),
+        }
+    }
+
+    #[test]
+    fn parses_hysteria2_link_without_password_as_empty_password() {
+        let parsed = parse_proxy_line("hysteria2://example.com/?insecure=1#hy2-empty-password")
+            .unwrap()
+            .unwrap();
+
+        match parsed {
+            ParsedProxyLine::Mihomo(proxy) => {
+                assert_eq!(proxy.name, "hy2-empty-password");
+                assert_eq!(proxy.kind, "hysteria2");
+                let text = serde_yaml::to_string(&proxy.value).unwrap();
+                assert!(text.contains("password: ''"));
             }
             ParsedProxyLine::Native(_) => panic!("expected complex node"),
         }

@@ -293,7 +293,10 @@ fn build_trojan(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Res
     let port = required_port(mapping, &["port"], &name)?;
     let network = transport_network(mapping);
     let password = required_string(mapping, &["password"], &name)?;
-    let sni = string_field(mapping, &["sni", "servername"]).unwrap_or_else(|| server.clone());
+    let sni = optional_tls_server_name_or_fallback(
+        string_field(mapping, &["sni", "servername"]).as_deref(),
+        &server,
+    )?;
     validate_tls_server_name(&sni)?;
     if !matches!(network.as_str(), "" | "tcp" | "trojan") {
         let transport = build_trojan_transport_chain(mapping, &server, &sni)?;
@@ -466,7 +469,10 @@ fn build_transport_chain(
         push_tls_layer(
             &mut chain,
             mapping,
-            string_field(mapping, &["servername", "sni"]).unwrap_or_else(|| server.to_owned()),
+            optional_tls_server_name_or_fallback(
+                string_field(mapping, &["servername", "sni"]).as_deref(),
+                server,
+            )?,
             reality,
         )?;
     }
@@ -512,13 +518,16 @@ fn push_transport_layers(
         "" | "tcp" | "vmess" | "vless" | "trojan" => {}
         "ws" | "websocket" => {
             let options = mapping_field(mapping, "ws-opts");
-            let host_header = string_field_in(options, &["host"])
-                .or_else(|| header_field(options, "Host"))
-                .or_else(|| string_field(mapping, &["host"]))
-                .or_else(|| Some(server.to_owned()));
+            let host_header = valid_authority_or_fallback(
+                string_field_in(options, &["host"])
+                    .or_else(|| header_field(options, "Host"))
+                    .or_else(|| string_field(mapping, &["host"]))
+                    .as_deref(),
+                server,
+            );
             let config = WsConfig {
                 path: string_field_in(options, &["path"]).unwrap_or_else(|| "/".to_owned()),
-                host_header,
+                host_header: Some(host_header),
                 extra_headers: headers_from_mapping_without(options, &["host"]),
                 max_early_data: usize_field_in(options, &["max-early-data"]).unwrap_or(0),
                 early_data_header_name: string_field_in(options, &["early-data-header-name"]),
@@ -628,6 +637,29 @@ fn validate_tls_server_name(value: &str) -> Result<()> {
     ServerName::try_from(value.to_owned())
         .with_context(|| format!("TLS server name/SNI 无效：{value}"))?;
     Ok(())
+}
+
+fn optional_tls_server_name_or_fallback(value: Option<&str>, fallback: &str) -> Result<String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(fallback.to_owned());
+    };
+    validate_tls_server_name(value)?;
+    Ok(value.to_owned())
+}
+
+fn valid_authority_or_fallback(value: Option<&str>, fallback: &str) -> String {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return fallback.to_owned();
+    };
+    if is_valid_http_authority(value) {
+        value.to_owned()
+    } else {
+        fallback.to_owned()
+    }
+}
+
+fn is_valid_http_authority(value: &str) -> bool {
+    http::uri::Authority::try_from(value.as_bytes()).is_ok()
 }
 
 fn parse_hy2_hop_interval(mapping: &serde_yaml::Mapping) -> Option<Hy2HopInterval> {
@@ -1046,6 +1078,62 @@ sni: t.me%2Fripaojiedian
         let result = build_meow_nodes(vec![proxy]);
         assert_eq!(result.nodes.len(), 0);
         assert_eq!(result.fallback.len(), 1);
+    }
+
+    #[test]
+    fn empty_trojan_sni_falls_back_to_server() {
+        let proxy = complex(
+            r#"
+name: trojan-empty-sni
+type: trojan
+server: example.com
+port: 443
+password: pass
+sni: ""
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
+    }
+
+    #[test]
+    fn empty_vless_tls_server_name_falls_back_to_server() {
+        let proxy = complex(
+            r#"
+name: vless-empty-sni
+type: vless
+server: example.com
+port: 443
+uuid: 00000000-0000-0000-0000-000000000000
+tls: true
+servername: ""
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
+    }
+
+    #[test]
+    fn invalid_ws_host_falls_back_to_server_authority() {
+        let proxy = complex(
+            r#"
+name: vless-invalid-ws-host
+type: vless
+server: example.com
+port: 443
+uuid: 00000000-0000-0000-0000-000000000000
+network: ws
+ws-opts:
+  path: /ws
+  headers:
+    Host: ""
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
     }
 
     #[test]
