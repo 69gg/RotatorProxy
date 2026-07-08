@@ -27,6 +27,7 @@ use crate::{
 
 const MAX_SUBSCRIPTION_DEPTH: usize = 4;
 const BASE64_MIN_LEN: usize = 8;
+const HYSTERIA2_DEFAULT_PORT: u16 = 443;
 
 const BASE64_STANDARD: GeneralPurpose = GeneralPurpose::new(
     &alphabet::STANDARD,
@@ -386,7 +387,7 @@ pub fn parse_proxy_url(line: &str) -> Result<Option<ProxyNode>> {
             if !looks_like_http_proxy_url(&url) {
                 return Ok(None);
             }
-            let addr = host_port_from_url(&url)?;
+            let addr = host_port_from_url(&url, Some(80))?;
             Ok(Some(ProxyNode::Http {
                 addr,
                 auth: credentials_from_url(&url),
@@ -396,7 +397,7 @@ pub fn parse_proxy_url(line: &str) -> Result<Option<ProxyNode>> {
             if !looks_like_https_proxy_url(&url) {
                 return Ok(None);
             }
-            let addr = host_port_from_url(&url)?;
+            let addr = host_port_from_url(&url, Some(443))?;
             Ok(Some(ProxyNode::Https {
                 addr,
                 auth: credentials_from_url(&url),
@@ -408,7 +409,7 @@ pub fn parse_proxy_url(line: &str) -> Result<Option<ProxyNode>> {
             }))
         }
         "socks" | "socks5" | "socks5h" => {
-            let addr = host_port_from_url(&url)?;
+            let addr = host_port_from_url(&url, None)?;
             Ok(Some(ProxyNode::Socks5 {
                 addr,
                 auth: socks_credentials_from_url(&url),
@@ -416,7 +417,7 @@ pub fn parse_proxy_url(line: &str) -> Result<Option<ProxyNode>> {
             }))
         }
         "socks4" | "socks4a" => {
-            let addr = host_port_from_url(&url)?;
+            let addr = host_port_from_url(&url, None)?;
             Ok(Some(ProxyNode::Socks4 {
                 addr,
                 auth: credentials_from_url(&url),
@@ -633,7 +634,7 @@ fn parse_trojan_url(url: &Url) -> Result<MihomoProxyConfig> {
 fn parse_hysteria2_url(url: &Url) -> Result<MihomoProxyConfig> {
     let name = proxy_name_from_url(url, "hysteria2");
     let server = required_host(url, "hysteria2")?;
-    let port = port_or_first_mport(url, "hysteria2")?;
+    let port = port_or_first_mport(url).unwrap_or(HYSTERIA2_DEFAULT_PORT);
     let password = query_param(url, "password")
         .or_else(|| query_param(url, "auth"))
         .or_else(|| {
@@ -834,14 +835,14 @@ fn parse_ssr_url(encoded: &str) -> Result<MihomoProxyConfig> {
 }
 
 fn looks_like_http_proxy_url(url: &Url) -> bool {
-    url.port().is_some()
+    url_has_explicit_port(url)
         && (url.path().is_empty() || url.path() == "/")
         && url.query().is_none()
         && url.fragment().is_none()
 }
 
 fn looks_like_https_proxy_url(url: &Url) -> bool {
-    url.port().is_some()
+    port_or_known_default(url, Some(443)).is_some()
         && (url.path().is_empty() || url.path() == "/")
         && (!url.username().is_empty()
             || url.fragment().is_some()
@@ -852,14 +853,49 @@ fn looks_like_https_proxy_url(url: &Url) -> bool {
             || query_param(url, "insecure").is_some())
 }
 
-fn host_port_from_url(url: &Url) -> Result<HostPort> {
+fn host_port_from_url(url: &Url, default_port: Option<u16>) -> Result<HostPort> {
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("代理 URL 缺少 host"))?;
-    let port = url
-        .port()
+    let port = port_or_known_default(url, default_port)
         .ok_or_else(|| anyhow!("代理 URL 缺少 port：{url}"))?;
     HostPort::new(host, port)
+}
+
+fn port_or_known_default(url: &Url, default_port: Option<u16>) -> Option<u16> {
+    url.port().or_else(|| {
+        let default_port = default_port?;
+        (url_has_explicit_port(url) || url.port_or_known_default() == Some(default_port))
+            .then_some(default_port)
+    })
+}
+
+fn url_has_explicit_port(url: &Url) -> bool {
+    let Some((_, rest)) = url.as_str().split_once("://") else {
+        return false;
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit_once('@')
+        .map_or_else(|| authority_without_userinfo(rest), |(_, value)| value);
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .and_then(|(_, suffix)| suffix.strip_prefix(':'))
+            .is_some_and(|port| !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()));
+    }
+
+    authority
+        .rsplit_once(':')
+        .filter(|(host, _)| !host.contains(':'))
+        .is_some_and(|(_, port)| !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn authority_without_userinfo(rest: &str) -> &str {
+    rest.split(['/', '?', '#']).next().unwrap_or_default()
 }
 
 fn credentials_from_url(url: &Url) -> Option<Credentials> {
@@ -1371,14 +1407,14 @@ fn required_port(url: &Url, scheme: &str) -> Result<u16> {
     url.port().ok_or_else(|| anyhow!("{scheme} 链接缺少 port"))
 }
 
-fn port_or_first_mport(url: &Url, scheme: &str) -> Result<u16> {
+fn port_or_first_mport(url: &Url) -> Option<u16> {
     if let Some(port) = url.port() {
-        return Ok(port);
+        return Some(port);
     }
-    let mport = query_param(url, "mport")
+    query_param(url, "mport")
         .or_else(|| query_param(url, "ports"))
-        .ok_or_else(|| anyhow!("{scheme} 链接缺少 port"))?;
-    first_port_from_range(&mport).ok_or_else(|| anyhow!("{scheme} 链接 mport 无效：{mport}"))
+        .as_deref()
+        .and_then(first_port_from_range)
 }
 
 fn first_port_from_range(value: &str) -> Option<u16> {
@@ -1612,6 +1648,11 @@ mod tests {
         assert!(!is_subscription_url(
             "https://user:pass@example.com:443?sni=example.com#node"
         ));
+        assert!(
+            parse_proxy_url("https://example.com:443/sub")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1677,6 +1718,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_https_proxy_url_from_subscription_sample() {
+        let proxy = parse_proxy_url(
+            "https://51362ab6-b5e6-11ea-ad28-f23c913c8d2b:51362ab6-b5e6-11ea-ad28-f23c913c8d2b@bfc8d59d-t9zts0-tnkuks-wujn.se.oshuawei.com:443?sni=bfc8d59d-t9zts0-tnkuks-wujn.se.oshuawei.com#US-Seattle-h-419420622-yupj",
+        )
+        .unwrap()
+        .unwrap();
+        match proxy {
+            ProxyNode::Https {
+                addr,
+                auth,
+                sni,
+                skip_cert_verify,
+            } => {
+                assert_eq!(addr.host, "bfc8d59d-t9zts0-tnkuks-wujn.se.oshuawei.com");
+                assert_eq!(addr.port, 443);
+                assert_eq!(
+                    auth.unwrap().username,
+                    "51362ab6-b5e6-11ea-ad28-f23c913c8d2b"
+                );
+                assert_eq!(
+                    sni.as_deref(),
+                    Some("bfc8d59d-t9zts0-tnkuks-wujn.se.oshuawei.com")
+                );
+                assert!(!skip_cert_verify);
+            }
+            other => panic!("unexpected proxy: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_ss_raw_userinfo_with_cipher_alias() {
         let proxy = parse_proxy_url("ss://chacha20-poly1305:pass@example.com:8388#ss-a")
             .unwrap()
@@ -1724,7 +1795,7 @@ http://127.0.0.1:8080 # inline comment
         )
         .unwrap();
         assert_eq!(parsed.subscription_urls.len(), 0);
-        assert_eq!(parsed.proxies.native.len(), 1);
+        assert_eq!(parsed.proxies.native.len(), 2);
     }
 
     #[test]
@@ -2018,6 +2089,23 @@ proxies:
                 assert!(text.contains("obfs-password: secret"));
                 assert!(text.contains("up-mbps: '11'"));
                 assert!(text.contains("down-mbps: '55'"));
+            }
+            ParsedProxyLine::Native(_) => panic!("expected complex node"),
+        }
+    }
+
+    #[test]
+    fn parses_hysteria2_link_without_port_as_default_443() {
+        let parsed = parse_proxy_line("hysteria2://pass@example.com/?insecure=1#hy2-default")
+            .unwrap()
+            .unwrap();
+
+        match parsed {
+            ParsedProxyLine::Mihomo(proxy) => {
+                assert_eq!(proxy.name, "hy2-default");
+                assert_eq!(proxy.kind, "hysteria2");
+                let text = serde_yaml::to_string(&proxy.value).unwrap();
+                assert!(text.contains("port: 443"));
             }
             ParsedProxyLine::Native(_) => panic!("expected complex node"),
         }
