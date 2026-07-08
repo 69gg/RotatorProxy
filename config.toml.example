@@ -69,11 +69,11 @@ runtime_disable_after_cooldowns = 2
 # How long a runtime-failing node is skipped before it can be tried again.
 cooldown_seconds = 300
 
-# Persist the proxy pool failure state across restarts. The state file stores
-# hashed proxy keys only, so credentials are not written in plaintext.
+# Persist the active proxy pool and failure state across restarts. The active
+# pool cache stores full proxy configs and may include proxy credentials.
 pool_state_enabled = true
 
-# JSON file used for persisted disabled/retired proxy state.
+# JSON file used for persisted active/disabled/retired proxy state.
 pool_state_path = ".rotator-proxy/pool-state.json"
 
 # Local time for the daily full reload + health check.

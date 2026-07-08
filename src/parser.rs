@@ -67,7 +67,7 @@ impl LoadedProxySet {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MihomoProxyConfig {
     pub name: String,
     pub kind: String,

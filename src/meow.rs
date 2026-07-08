@@ -543,6 +543,7 @@ fn meow_node(
         adapter,
         key: format!("meow://{}:{name}@{server}:{port}", proxy.kind),
         label: format!("meow:{}:{name}", proxy.kind),
+        source: proxy.clone(),
     })
 }
 

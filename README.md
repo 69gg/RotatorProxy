@@ -51,8 +51,8 @@ cargo run --release -- --config config.toml
 - `runtime_failure_threshold`：活动节点运行时连接失败多少次后进入冷却。
 - `runtime_disable_after_cooldowns`：节点进入冷却多少次后加入失效名单，默认 `2`。如果关闭健康预检查并希望请求失败后立刻冷却，建议把 `runtime_failure_threshold` 设为 `1`。
 - `cooldown_seconds`：运行时故障节点被跳过的冷却时长。
-- `pool_state_enabled`：是否把失效名单和淘汰名单持久化到本地状态文件，默认 `true`。
-- `pool_state_path`：代理池状态文件路径，默认 `.rotator-proxy/pool-state.json`。状态文件只保存代理 key 的 SHA-256 哈希，不写入明文账号、密码或完整代理 URL。
+- `pool_state_enabled`：是否把可用池、失效名单和淘汰名单持久化到本地状态文件，默认 `true`。
+- `pool_state_path`：代理池状态文件路径，默认 `.rotator-proxy/pool-state.json`。可用池会保存完整代理配置，可能包含代理地址、账号和密码；失效名单和淘汰名单使用代理 key 的 SHA-256 哈希记录。
 - `daily_refresh_time`：每天完整重新加载和测活的本地时间，格式为 `HH:MM`。未设置 `refresh_interval_seconds` 时生效。
 - `refresh_interval_seconds`：可选固定刷新间隔，单位秒。设置后优先于 `daily_refresh_time`，用于更频繁地更新订阅 URL 和本地来源。
 - `mihomo_enabled`：历史兼容配置项。Mihomo fallback 当前已停用，进程内后端无法拨号的复杂 Clash 节点会被跳过。
@@ -139,7 +139,7 @@ RotatorProxy 不会监控输入目录变化。它只会在启动时和配置的�
 
 每次来源刷新都会对失效名单里的节点执行后台静默健康检查，即使 `health_check_enabled = false` 也会执行。静默测活成功的失效节点会清空失败计数并恢复轮询；静默测活连续失败 3 次的节点会从活动池删除，并在当前进程内记为淘汰，后续刷新即使订阅源仍然包含同 key 节点也不会重新加入。启动阶段如果没有任何健康节点，会按空活动池启动。定时刷新阶段如果新一轮测活没有任何健康节点，现有活动池继续服务。
 
-默认启用 `pool_state_enabled` 后，失效名单、失效静默测活失败次数和淘汰名单会写入 `pool_state_path`。重启后，RotatorProxy 会重新从代理来源解析节点，并用当前节点 key 的 SHA-256 哈希匹配状态文件：命中失效名单的节点继续等待静默测活恢复，命中淘汰名单的节点继续跳过。普通冷却状态和活动代理节点本体不会持久化。状态文件损坏或版本不支持时，只会记录警告并按空状态启动。
+默认启用 `pool_state_enabled` 后，可用池、失效名单、失效静默测活失败次数和淘汰名单会写入 `pool_state_path`。重启后，RotatorProxy 会先从状态文件恢复上次可用池，再从代理来源增量加入新节点；因此某个仍可用节点即使已经从订阅源消失，也能在重启后继续参与轮询。命中失效名单的节点继续等待静默测活恢复，命中淘汰名单的节点继续跳过。普通冷却状态、随机轮询袋顺序和单次失败计数不会持久化。状态文件中的可用池会保存完整代理配置，可能包含账号密码；如果不希望凭据落盘，请设置 `pool_state_enabled = false`。状态文件损坏或版本不支持时，只会记录警告并按空状态启动。
 
 日志会覆盖来源加载、订阅获取失败、解析异常汇总、健康检查开始/完成总结、代理池更新、运行时失败、冷却和失效状态变化。RotatorProxy 自身日志使用中文；依赖库日志会按其原始内容输出。逐行解析失败明细默认在 debug 日志中输出，避免大型公开源刷屏。
 

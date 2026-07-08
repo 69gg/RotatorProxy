@@ -4,6 +4,7 @@ use std::{
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -13,14 +14,18 @@ use meow_common::{AdapterType, ProxyAdapter};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use shadowsocks::{ServerConfig, relay::socks5::Address as ShadowAddress};
+use shadowsocks::{
+    ServerConfig, config::ServerAddr, crypto::CipherKind, relay::socks5::Address as ShadowAddress,
+};
 use tracing::{debug, info, warn};
+
+use crate::{meow::build_meow_nodes, parser::MihomoProxyConfig};
 
 const FAILURE_SHARDS: usize = 64;
 const DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS: usize = 2;
 const DEFAULT_DISABLED_RECHECK_DELETE_AFTER_FAILURES: usize = 3;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostPort {
     pub host: String,
     pub port: u16,
@@ -46,7 +51,7 @@ impl fmt::Display for HostPort {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Credentials {
     pub username: String,
     pub password: Option<String>,
@@ -57,6 +62,7 @@ pub struct MeowProxyNode {
     pub adapter: Arc<dyn ProxyAdapter>,
     pub key: String,
     pub label: String,
+    pub source: MihomoProxyConfig,
 }
 
 impl fmt::Debug for MeowProxyNode {
@@ -400,9 +406,11 @@ struct PoolState {
     generation: u64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct PersistedPoolState {
     version: u8,
+    #[serde(default)]
+    available: Vec<PersistedProxyNode>,
     #[serde(default)]
     disabled: Vec<PersistedDisabledProxy>,
     #[serde(default)]
@@ -413,6 +421,41 @@ struct PersistedPoolState {
 struct PersistedDisabledProxy {
     key_hash: String,
     disabled_recheck_failures: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistedProxyNode {
+    Http {
+        addr: HostPort,
+        auth: Option<Credentials>,
+    },
+    Https {
+        addr: HostPort,
+        auth: Option<Credentials>,
+        sni: Option<String>,
+        skip_cert_verify: bool,
+    },
+    Socks5 {
+        addr: HostPort,
+        auth: Option<Credentials>,
+        remote_dns: bool,
+    },
+    Socks4 {
+        addr: HostPort,
+        auth: Option<Credentials>,
+        remote_dns: bool,
+    },
+    Shadowsocks {
+        host: String,
+        port: u16,
+        method: String,
+        password: String,
+        label: String,
+    },
+    Meow {
+        source: MihomoProxyConfig,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -500,23 +543,40 @@ impl ProxyPool {
                         None
                     }
                 });
-        Self {
+        let retired_hashes = persisted
+            .as_ref()
+            .map(|state| state.retired.iter().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        let disabled_by_hash = persisted
+            .as_ref()
+            .map(|state| {
+                state
+                    .disabled
+                    .iter()
+                    .cloned()
+                    .map(|entry| (entry.key_hash.clone(), entry))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let persisted_proxies = persisted
+            .as_ref()
+            .map(|state| restore_persisted_proxy_nodes(&state.available))
+            .unwrap_or_default();
+        let persisted_proxy_count = persisted_proxies.len();
+        let mut initial_entries = entries_from_nodes(persisted_proxies);
+        initial_entries.extend(entries_from_nodes(proxies));
+        let mut known = HashSet::new();
+        initial_entries.retain(|entry| {
+            let key_hash = proxy_key_hash(&entry.key);
+            !retired_hashes.contains(&key_hash) && known.insert(entry.key.clone())
+        });
+
+        let pool = Self {
             inner: Arc::new(ProxyPoolInner {
                 state: RwLock::new(PoolState {
-                    proxies: Arc::new(entries_from_nodes(proxies)),
-                    retired_hashes: persisted
-                        .as_ref()
-                        .map(|state| state.retired.iter().cloned().collect())
-                        .unwrap_or_default(),
-                    disabled_by_hash: persisted
-                        .map(|state| {
-                            state
-                                .disabled
-                                .into_iter()
-                                .map(|entry| (entry.key_hash.clone(), entry))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    proxies: Arc::new(initial_entries),
+                    retired_hashes,
+                    disabled_by_hash,
                     generation: 0,
                 }),
                 selection: Mutex::new(SelectionBag::default()),
@@ -529,7 +589,17 @@ impl ProxyPool {
                     .map(|_| Mutex::new(HashMap::new()))
                     .collect(),
             }),
+        };
+        pool.restore_persisted_failure_records();
+        if persisted_proxy_count > 0 {
+            info!(
+                restored_nodes = persisted_proxy_count,
+                active_nodes = pool.len(),
+                "已从代理池状态文件恢复可用代理"
+            );
         }
+        pool.persist_state();
+        pool
     }
 
     pub fn len(&self) -> usize {
@@ -625,6 +695,7 @@ impl ProxyPool {
         if let Some(generation) = generation_to_reset {
             self.reset_selection(generation);
         }
+        self.persist_state();
         info!(
             previous_nodes = summary.previous,
             added_nodes = summary.added,
@@ -935,6 +1006,33 @@ impl ProxyPool {
         }
     }
 
+    fn restore_persisted_failure_records(&self) {
+        let disabled_by_hash = {
+            let guard = self.inner.state.read().expect("proxy pool lock poisoned");
+            guard.disabled_by_hash.clone()
+        };
+        if disabled_by_hash.is_empty() {
+            return;
+        }
+        for entry in self.snapshot().iter() {
+            let key_hash = proxy_key_hash(&entry.key);
+            let Some(disabled) = disabled_by_hash.get(&key_hash) else {
+                continue;
+            };
+            let mut failures = self.failure_shard(&entry.key);
+            failures.insert(
+                entry.key.clone(),
+                FailureRecord {
+                    failures: 0,
+                    cooldowns: self.inner.runtime_disable_after_cooldowns,
+                    cooldown_until: None,
+                    disabled: true,
+                    disabled_recheck_failures: disabled.disabled_recheck_failures,
+                },
+            );
+        }
+    }
+
     fn persist_disabled_entry(&self, key: &str, disabled_recheck_failures: usize) {
         {
             let mut guard = self.inner.state.write().expect("proxy pool lock poisoned");
@@ -965,7 +1063,12 @@ impl ProxyPool {
         let state = {
             let guard = self.inner.state.read().expect("proxy pool lock poisoned");
             PersistedPoolState {
-                version: 1,
+                version: 2,
+                available: guard
+                    .proxies
+                    .iter()
+                    .filter_map(|entry| persisted_proxy_node_from_entry(entry))
+                    .collect(),
                 disabled: guard.disabled_by_hash.values().cloned().collect(),
                 retired: guard.retired_hashes.iter().cloned().collect(),
             }
@@ -1064,6 +1167,128 @@ fn entries_from_nodes(proxies: Vec<ProxyNode>) -> Vec<Arc<ProxyEntry>> {
         .collect()
 }
 
+fn restore_persisted_proxy_nodes(nodes: &[PersistedProxyNode]) -> Vec<ProxyNode> {
+    let mut restored = Vec::new();
+    for node in nodes {
+        match proxy_node_from_persisted(node) {
+            Ok(Some(node)) => restored.push(node),
+            Ok(None) => {}
+            Err(err) => warn!("代理池缓存节点恢复失败，已跳过：{err:#}"),
+        }
+    }
+    restored
+}
+
+fn proxy_node_from_persisted(node: &PersistedProxyNode) -> Result<Option<ProxyNode>> {
+    match node {
+        PersistedProxyNode::Http { addr, auth } => Ok(Some(ProxyNode::Http {
+            addr: addr.clone(),
+            auth: auth.clone(),
+        })),
+        PersistedProxyNode::Https {
+            addr,
+            auth,
+            sni,
+            skip_cert_verify,
+        } => Ok(Some(ProxyNode::Https {
+            addr: addr.clone(),
+            auth: auth.clone(),
+            sni: sni.clone(),
+            skip_cert_verify: *skip_cert_verify,
+        })),
+        PersistedProxyNode::Socks5 {
+            addr,
+            auth,
+            remote_dns,
+        } => Ok(Some(ProxyNode::Socks5 {
+            addr: addr.clone(),
+            auth: auth.clone(),
+            remote_dns: *remote_dns,
+        })),
+        PersistedProxyNode::Socks4 {
+            addr,
+            auth,
+            remote_dns,
+        } => Ok(Some(ProxyNode::Socks4 {
+            addr: addr.clone(),
+            auth: auth.clone(),
+            remote_dns: *remote_dns,
+        })),
+        PersistedProxyNode::Shadowsocks {
+            host,
+            port,
+            method,
+            password,
+            label,
+        } => {
+            let method = CipherKind::from_str(method)
+                .map_err(|err| anyhow!("无效的 Shadowsocks cipher {method}：{err:?}"))?;
+            let server = ServerConfig::new(
+                ServerAddr::DomainName(host.clone(), *port),
+                password.clone(),
+                method,
+            )?;
+            Ok(Some(ProxyNode::Shadowsocks {
+                server: Arc::new(server),
+                label: label.clone(),
+            }))
+        }
+        PersistedProxyNode::Meow { source } => {
+            let mut result = build_meow_nodes(vec![source.clone()]);
+            Ok(result.nodes.pop())
+        }
+    }
+}
+
+fn persisted_proxy_node_from_entry(entry: &ProxyEntry) -> Option<PersistedProxyNode> {
+    match entry.node.as_ref() {
+        ProxyNode::Http { addr, auth } => Some(PersistedProxyNode::Http {
+            addr: addr.clone(),
+            auth: auth.clone(),
+        }),
+        ProxyNode::Https {
+            addr,
+            auth,
+            sni,
+            skip_cert_verify,
+        } => Some(PersistedProxyNode::Https {
+            addr: addr.clone(),
+            auth: auth.clone(),
+            sni: sni.clone(),
+            skip_cert_verify: *skip_cert_verify,
+        }),
+        ProxyNode::Socks5 {
+            addr,
+            auth,
+            remote_dns,
+        } => Some(PersistedProxyNode::Socks5 {
+            addr: addr.clone(),
+            auth: auth.clone(),
+            remote_dns: *remote_dns,
+        }),
+        ProxyNode::Socks4 {
+            addr,
+            auth,
+            remote_dns,
+        } => Some(PersistedProxyNode::Socks4 {
+            addr: addr.clone(),
+            auth: auth.clone(),
+            remote_dns: *remote_dns,
+        }),
+        ProxyNode::Shadowsocks { server, label } => Some(PersistedProxyNode::Shadowsocks {
+            host: server.addr().host(),
+            port: server.addr().port(),
+            method: server.method().to_string(),
+            password: server.password().to_owned(),
+            label: label.clone(),
+        }),
+        ProxyNode::Meow(node) => Some(PersistedProxyNode::Meow {
+            source: node.source.clone(),
+        }),
+        ProxyNode::LocalMihomo { .. } => None,
+    }
+}
+
 fn failure_shard_index(key: &str) -> usize {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
@@ -1078,7 +1303,8 @@ fn proxy_key_hash(key: &str) -> String {
 fn load_persisted_pool_state(path: &Path) -> Result<PersistedPoolState> {
     if !path.exists() {
         return Ok(PersistedPoolState {
-            version: 1,
+            version: 2,
+            available: Vec::new(),
             disabled: Vec::new(),
             retired: Vec::new(),
         });
@@ -1087,7 +1313,7 @@ fn load_persisted_pool_state(path: &Path) -> Result<PersistedPoolState> {
         .with_context(|| format!("读取代理池状态文件失败：{}", path.display()))?;
     let state: PersistedPoolState = serde_json::from_str(&raw)
         .with_context(|| format!("解析代理池状态文件失败：{}", path.display()))?;
-    if state.version != 1 {
+    if !matches!(state.version, 1 | 2) {
         bail!("代理池状态文件版本不支持：{}", state.version);
     }
     Ok(state)
@@ -1357,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_disabled_proxy_is_restored_without_plaintext_key() {
+    fn persisted_available_proxy_is_restored_with_plaintext_cache() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool-state.json");
         let sensitive = ProxyNode::Http {
@@ -1367,7 +1593,7 @@ mod tests {
                 password: Some("secret".to_owned()),
             }),
         };
-        let pool = ProxyPool::with_runtime_failure_policy_and_state(
+        let _pool = ProxyPool::with_runtime_failure_policy_and_state(
             vec![sensitive.clone()],
             0,
             1,
@@ -1375,13 +1601,11 @@ mod tests {
             1,
             Some(path.clone()),
         );
-        let choice = pool.candidates().pop().unwrap();
-        pool.report_failure(&choice);
 
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("user"));
-        assert!(!raw.contains("secret"));
-        assert!(!raw.contains("127.0.0.1:8080"));
+        assert!(raw.contains("\"version\": 2"));
+        assert!(raw.contains("user"));
+        assert!(raw.contains("secret"));
 
         let restored = ProxyPool::with_runtime_failure_policy_and_state(
             Vec::new(),
@@ -1391,9 +1615,39 @@ mod tests {
             1,
             Some(path),
         );
-        let summary = restored.merge(vec![sensitive]);
 
-        assert_eq!(summary.added, 1);
+        let labels = restored
+            .candidates()
+            .into_iter()
+            .map(|choice| choice.label())
+            .collect::<HashSet<_>>();
+        assert_eq!(labels, HashSet::from(["http://127.0.0.1:8080".to_owned()]));
+    }
+
+    #[test]
+    fn persisted_available_disabled_proxy_is_restored_as_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool-state.json");
+        let pool = ProxyPool::with_runtime_failure_policy_and_state(
+            vec![http_proxy(1)],
+            0,
+            1,
+            Duration::from_millis(30),
+            1,
+            Some(path.clone()),
+        );
+        let choice = pool.candidates().pop().unwrap();
+        pool.report_failure(&choice);
+
+        let restored = ProxyPool::with_runtime_failure_policy_and_state(
+            Vec::new(),
+            0,
+            1,
+            Duration::from_millis(30),
+            1,
+            Some(path),
+        );
+
         assert!(restored.candidates().is_empty());
         assert_eq!(restored.disabled_proxies().len(), 1);
     }
@@ -1419,6 +1673,7 @@ mod tests {
         let state: PersistedPoolState = serde_json::from_str(&raw).unwrap();
         assert!(state.disabled.is_empty());
         assert!(state.retired.is_empty());
+        assert_eq!(state.available.len(), 1);
     }
 
     #[test]
@@ -1457,6 +1712,24 @@ mod tests {
             .map(|choice| choice.label())
             .collect::<HashSet<_>>();
         assert_eq!(labels, HashSet::from(["http://127.0.0.1:2".to_owned()]));
+    }
+
+    #[test]
+    fn persisted_v1_state_is_still_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool-state.json");
+        std::fs::write(&path, r#"{"version":1,"disabled":[],"retired":[]}"#).unwrap();
+
+        let pool = ProxyPool::with_runtime_failure_policy_and_state(
+            Vec::new(),
+            0,
+            1,
+            Duration::from_millis(30),
+            1,
+            Some(path),
+        );
+
+        assert_eq!(pool.len(), 0);
     }
 
     #[test]

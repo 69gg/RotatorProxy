@@ -747,6 +747,74 @@ async fn persisted_retired_node_is_skipped_after_restart_refresh() -> io::Result
 }
 
 #[tokio::test]
+async fn persisted_available_node_survives_source_removal_after_restart() -> io::Result<()> {
+    let (first_proxy_addr, _first_proxy_handle) = spawn_http_connect_proxy().await?;
+    let (second_proxy_addr, _second_proxy_handle) = spawn_http_connect_proxy().await?;
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!(
+            "http://127.0.0.1:{}\nhttp://127.0.0.1:{}\n",
+            first_proxy_addr.port(),
+            second_proxy_addr.port()
+        ),
+    )
+    .unwrap();
+    let state_path = dir.path().join("pool-state.json");
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_enabled: false,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let first_pool = ProxyPool::with_runtime_failure_policy_and_state(
+        Vec::new(),
+        0,
+        1,
+        Duration::from_millis(30),
+        1,
+        Some(state_path.clone()),
+    );
+    let mihomo = MihomoManager::new();
+
+    let first_summary = refresh_proxy_pool(&config, &first_pool, &mihomo, "startup")
+        .await
+        .unwrap();
+    assert_eq!(first_summary.active, 2);
+
+    fs::write(
+        &proxy_file,
+        format!("http://127.0.0.1:{}\n", second_proxy_addr.port()),
+    )
+    .unwrap();
+    let restarted_pool = ProxyPool::with_runtime_failure_policy_and_state(
+        Vec::new(),
+        0,
+        1,
+        Duration::from_millis(30),
+        1,
+        Some(state_path),
+    );
+    let second_summary = refresh_proxy_pool(&config, &restarted_pool, &mihomo, "scheduled")
+        .await
+        .unwrap();
+
+    assert_eq!(second_summary.loaded, 1);
+    assert_eq!(second_summary.active, 2);
+    assert_eq!(
+        labels_from_pool(&restarted_pool)
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            format!("http://127.0.0.1:{}", first_proxy_addr.port()),
+            format!("http://127.0.0.1:{}", second_proxy_addr.port()),
+        ])
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn mihomo_fallback_nodes_are_skipped_even_when_mihomo_is_enabled() -> io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let proxy_file = dir.path().join("clash.yaml");
