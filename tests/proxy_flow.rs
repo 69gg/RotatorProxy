@@ -684,6 +684,69 @@ async fn disabled_node_is_removed_after_three_silent_recheck_failures() -> io::R
 }
 
 #[tokio::test]
+async fn persisted_retired_node_is_skipped_after_restart_refresh() -> io::Result<()> {
+    let bad_port = unused_local_port().await?;
+    let (good_proxy_addr, _good_proxy_handle) = spawn_http_connect_proxy().await?;
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!(
+            "http://127.0.0.1:{bad_port}\nhttp://127.0.0.1:{}\n",
+            good_proxy_addr.port()
+        ),
+    )
+    .unwrap();
+    let state_path = dir.path().join("pool-state.json");
+    let bad_proxy = ProxyNode::Http {
+        addr: HostPort::new("127.0.0.1", bad_port).unwrap(),
+        auth: None,
+    };
+    let first_pool = ProxyPool::with_runtime_failure_policy_and_state(
+        vec![bad_proxy],
+        0,
+        1,
+        Duration::from_millis(30),
+        1,
+        Some(state_path.clone()),
+    );
+    let choice = first_pool.candidates().pop().unwrap();
+    first_pool.report_failure(&choice);
+    let bad_key = format!("http://127.0.0.1:{bad_port}");
+    for _ in 0..3 {
+        let _ = first_pool.report_disabled_recheck_failure(&bad_key);
+    }
+
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_enabled: false,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let restarted_pool = ProxyPool::with_runtime_failure_policy_and_state(
+        Vec::new(),
+        0,
+        1,
+        Duration::from_millis(30),
+        1,
+        Some(state_path),
+    );
+    let mihomo = MihomoManager::new();
+
+    let summary = refresh_proxy_pool(&config, &restarted_pool, &mihomo, "scheduled")
+        .await
+        .unwrap();
+
+    assert_eq!(summary.loaded, 2);
+    assert_eq!(summary.active, 1);
+    assert_eq!(
+        labels_from_pool(&restarted_pool),
+        vec![format!("http://127.0.0.1:{}", good_proxy_addr.port())]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn mihomo_fallback_nodes_are_skipped_even_when_mihomo_is_enabled() -> io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let proxy_file = dir.path().join("clash.yaml");

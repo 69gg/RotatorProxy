@@ -14,12 +14,15 @@ async fn main() -> Result<()> {
     let config = AppConfig::load(&config_path)?;
     init_logging(&config.log_level)?;
 
-    let pool = ProxyPool::with_runtime_failure_policy(
+    let pool = ProxyPool::with_runtime_failure_policy_and_state(
         Vec::new(),
         config.max_retries,
         config.runtime_failure_threshold,
         Duration::from_secs(config.cooldown_seconds),
         config.runtime_disable_after_cooldowns,
+        config
+            .pool_state_enabled
+            .then(|| config.pool_state_path.clone()),
     );
     let mihomo = MihomoManager::new();
     info!("启动阶段开始刷新代理，完成前暂不提供服务");

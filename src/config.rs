@@ -26,6 +26,8 @@ const DEFAULT_HEALTH_CHECK_TLS_SKIP_VERIFY: bool = false;
 const DEFAULT_RUNTIME_FAILURE_THRESHOLD: usize = 3;
 const DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS: usize = 2;
 const DEFAULT_COOLDOWN_SECONDS: u64 = 300;
+const DEFAULT_POOL_STATE_ENABLED: bool = true;
+const DEFAULT_POOL_STATE_PATH: &str = ".rotator-proxy/pool-state.json";
 const DEFAULT_DAILY_REFRESH_TIME: &str = "04:00";
 const DEFAULT_MIHOMO_ENABLED: bool = false;
 const DEFAULT_MIHOMO_AUTO_DOWNLOAD: bool = false;
@@ -56,6 +58,8 @@ pub struct AppConfig {
     pub runtime_failure_threshold: usize,
     pub runtime_disable_after_cooldowns: usize,
     pub cooldown_seconds: u64,
+    pub pool_state_enabled: bool,
+    pub pool_state_path: PathBuf,
     pub daily_refresh_time: String,
     pub refresh_interval_seconds: Option<u64>,
     pub mihomo_enabled: bool,
@@ -89,6 +93,8 @@ impl Default for AppConfig {
             runtime_failure_threshold: DEFAULT_RUNTIME_FAILURE_THRESHOLD,
             runtime_disable_after_cooldowns: DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS,
             cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
+            pool_state_enabled: DEFAULT_POOL_STATE_ENABLED,
+            pool_state_path: PathBuf::from(DEFAULT_POOL_STATE_PATH),
             daily_refresh_time: DEFAULT_DAILY_REFRESH_TIME.to_owned(),
             refresh_interval_seconds: None,
             mihomo_enabled: DEFAULT_MIHOMO_ENABLED,
@@ -155,6 +161,9 @@ impl AppConfig {
         }
         if self.cooldown_seconds == 0 {
             bail!("cooldown_seconds 必须大于 0");
+        }
+        if self.pool_state_enabled && self.pool_state_path.as_os_str().is_empty() {
+            bail!("pool_state_enabled=true 时 pool_state_path 不能为空");
         }
         if self
             .refresh_interval_seconds
@@ -308,6 +317,11 @@ proxy_dirs = ["./fixtures"]
             config.runtime_disable_after_cooldowns,
             DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS
         );
+        assert!(config.pool_state_enabled);
+        assert_eq!(
+            config.pool_state_path,
+            PathBuf::from(".rotator-proxy/pool-state.json")
+        );
         assert_eq!(config.refresh_interval_seconds, None);
         assert!(config.subscription_proxy.is_none());
         assert!(!config.mihomo_enabled);
@@ -432,6 +446,26 @@ proxy_dirs = ["./fixtures"]
     fn rejects_zero_runtime_disable_after_cooldowns() {
         let config = AppConfig {
             runtime_disable_after_cooldowns: 0,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn disabled_pool_state_allows_empty_path() {
+        let config = AppConfig {
+            pool_state_enabled: false,
+            pool_state_path: PathBuf::new(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_pool_state_rejects_empty_path() {
+        let config = AppConfig {
+            pool_state_enabled: true,
+            pool_state_path: PathBuf::new(),
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());
