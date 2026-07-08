@@ -552,6 +552,7 @@ fn parse_mihomo_proxy_url(line: &str) -> Result<Option<MihomoProxyConfig>> {
     match url.scheme().to_ascii_lowercase().as_str() {
         "vless" => parse_vless_url(&url).map(Some),
         "trojan" => parse_trojan_url(&url).map(Some),
+        "hysteria" => parse_hysteria_url(&url).map(Some),
         "hysteria2" | "hy2" => parse_hysteria2_url(&url).map(Some),
         "tuic" => parse_tuic_url(&url).map(Some),
         "anytls" => parse_anytls_url(&url).map(Some),
@@ -632,14 +633,64 @@ fn parse_trojan_url(url: &Url) -> Result<MihomoProxyConfig> {
 fn parse_hysteria2_url(url: &Url) -> Result<MihomoProxyConfig> {
     let name = proxy_name_from_url(url, "hysteria2");
     let server = required_host(url, "hysteria2")?;
-    let port = required_port(url, "hysteria2")?;
-    let password = decode_url_component(url.username());
+    let port = port_or_first_mport(url, "hysteria2")?;
+    let password = query_param(url, "password")
+        .or_else(|| query_param(url, "auth"))
+        .or_else(|| {
+            let username = decode_url_component(url.username());
+            (!username.is_empty()).then_some(username)
+        })
+        .unwrap_or_default();
     if password.is_empty() {
         return Err(anyhow!("hysteria2 链接缺少 password"));
     }
 
     let mut proxy = ClashProxyDocument::new(name, "hysteria2", server, port);
     proxy.insert_string("password", password);
+    apply_hysteria_common_query(&mut proxy, url);
+    if let Some(mport) = query_param(url, "mport").or_else(|| query_param(url, "ports")) {
+        proxy.insert_string("ports", mport);
+    }
+    if let Some(hop_interval) =
+        query_param(url, "hop-interval").or_else(|| query_param(url, "hop_interval"))
+    {
+        proxy.insert_string("hop-interval", hop_interval);
+    }
+    if let Some(obfs) = query_param(url, "obfs").filter(|value| !value.is_empty()) {
+        proxy.insert_string("obfs", obfs);
+    }
+    if let Some(obfs_password) = query_param(url, "obfs-password")
+        .or_else(|| query_param(url, "obfs_password"))
+        .filter(|value| !value.is_empty())
+    {
+        proxy.insert_string("obfs-password", obfs_password);
+    }
+    proxy.into_mihomo("hysteria2")
+}
+
+fn parse_hysteria_url(url: &Url) -> Result<MihomoProxyConfig> {
+    let name = proxy_name_from_url(url, "hysteria");
+    let server = required_host(url, "hysteria")?;
+    let port = required_port(url, "hysteria")?;
+    let auth = query_param(url, "auth")
+        .or_else(|| query_param(url, "password"))
+        .or_else(|| {
+            let username = decode_url_component(url.username());
+            (!username.is_empty()).then_some(username)
+        })
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("hysteria 链接缺少 auth/password"))?;
+
+    let mut proxy = ClashProxyDocument::new(name, "hysteria", server, port);
+    proxy.insert_string("auth", auth);
+    apply_hysteria_common_query(&mut proxy, url);
+    if let Some(protocol) = query_param(url, "protocol").filter(|value| !value.is_empty()) {
+        proxy.insert_string("protocol", protocol);
+    }
+    proxy.into_mihomo("hysteria")
+}
+
+fn apply_hysteria_common_query(proxy: &mut ClashProxyDocument, url: &Url) {
     if query_param(url, "insecure").is_some_and(|value| value == "1" || value == "true") {
         proxy.insert_bool("skip-cert-verify", true);
     }
@@ -647,7 +698,31 @@ fn parse_hysteria2_url(url: &Url) -> Result<MihomoProxyConfig> {
         proxy.insert_string("sni", sni.clone());
         proxy.insert_string("servername", sni);
     }
-    proxy.into_mihomo("hysteria2")
+    if let Some(alpn) = query_param(url, "alpn").filter(|value| !value.is_empty()) {
+        let values = alpn
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if !values.is_empty() {
+            proxy.insert_strings("alpn", values);
+        }
+    }
+    for (query_key, clash_key) in [
+        ("upmbps", "up-mbps"),
+        ("up_mbps", "up-mbps"),
+        ("up", "up"),
+        ("downmbps", "down-mbps"),
+        ("down_mbps", "down-mbps"),
+        ("down", "down"),
+        ("pinSHA256", "pinSHA256"),
+        ("fingerprint", "fingerprint"),
+    ] {
+        if let Some(value) = query_param(url, query_key).filter(|value| !value.is_empty()) {
+            proxy.insert_string(clash_key, value);
+        }
+    }
 }
 
 fn parse_tuic_url(url: &Url) -> Result<MihomoProxyConfig> {
@@ -970,10 +1045,19 @@ fn clash_entry_to_proxy(entry: &ClashProxy) -> Result<ClashProxyDecision> {
 
     match kind.as_str() {
         "http" => {
-            if entry.tls.unwrap_or(false) {
-                return Ok(ClashProxyDecision::Mihomo);
-            }
             let (server, port) = clash_server_port(entry, &name)?;
+            if entry.tls.unwrap_or(false) {
+                return Ok(ClashProxyDecision::Native(ProxyNode::Https {
+                    addr: HostPort::new(server, port)?,
+                    auth: credentials_from_parts(entry.username.clone(), entry.password.clone()),
+                    sni: clash_string_extra(entry, &["sni", "servername"]),
+                    skip_cert_verify: clash_bool_extra(
+                        entry,
+                        &["skip-cert-verify", "allow-insecure", "insecure"],
+                    )
+                    .unwrap_or(false),
+                }));
+            }
             Ok(ClashProxyDecision::Native(ProxyNode::Http {
                 addr: HostPort::new(server, port)?,
                 auth: credentials_from_parts(entry.username.clone(), entry.password.clone()),
@@ -1028,6 +1112,16 @@ fn clash_server_port(entry: &ClashProxy, name: &str) -> Result<(String, u16)> {
         .ok_or_else(|| anyhow!("代理 {name} 缺少 server"))?;
     let port = entry.port.ok_or_else(|| anyhow!("代理 {name} 缺少 port"))?;
     Ok((server, port))
+}
+
+fn clash_string_extra(entry: &ClashProxy, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| entry.extra.get(*key).and_then(yaml_value_to_string))
+}
+
+fn clash_bool_extra(entry: &ClashProxy, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| entry.extra.get(*key).and_then(yaml_value_to_bool))
 }
 
 fn is_mihomo_only_clash_type(kind: &str) -> bool {
@@ -1277,6 +1371,22 @@ fn required_port(url: &Url, scheme: &str) -> Result<u16> {
     url.port().ok_or_else(|| anyhow!("{scheme} 链接缺少 port"))
 }
 
+fn port_or_first_mport(url: &Url, scheme: &str) -> Result<u16> {
+    if let Some(port) = url.port() {
+        return Ok(port);
+    }
+    let mport = query_param(url, "mport")
+        .or_else(|| query_param(url, "ports"))
+        .ok_or_else(|| anyhow!("{scheme} 链接缺少 port"))?;
+    first_port_from_range(&mport).ok_or_else(|| anyhow!("{scheme} 链接 mport 无效：{mport}"))
+}
+
+fn first_port_from_range(value: &str) -> Option<u16> {
+    value
+        .split([',', '-'])
+        .find_map(|part| part.trim().parse::<u16>().ok())
+}
+
 fn proxy_name_from_url(url: &Url, fallback: &str) -> String {
     url.fragment()
         .map(decode_url_component)
@@ -1359,6 +1469,27 @@ fn yaml_value_to_u64(value: &serde_yaml::Value) -> Option<u64> {
     match value {
         serde_yaml::Value::Number(value) => value.as_u64(),
         serde_yaml::Value::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn yaml_value_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(value) => Some(value.clone()),
+        serde_yaml::Value::Number(value) => Some(value.to_string()),
+        serde_yaml::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn yaml_value_to_bool(value: &serde_yaml::Value) -> Option<bool> {
+    match value {
+        serde_yaml::Value::Bool(value) => Some(*value),
+        serde_yaml::Value::Number(value) => Some(value.as_u64()? != 0),
+        serde_yaml::Value::String(value) => Some(matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )),
         _ => None,
     }
 }
@@ -1686,6 +1817,40 @@ proxies:
     }
 
     #[test]
+    fn parses_clash_https_proxy_as_native_https_connect() {
+        let yaml = r#"
+proxies:
+  - name: https-a
+    type: http
+    server: proxy.example.com
+    port: "443"
+    username: user
+    password: pass
+    tls: true
+    sni: tls.example.com
+    skip-cert-verify: true
+"#;
+        let proxies = parse_clash_yaml(yaml, "test").unwrap().unwrap();
+        assert_eq!(proxies.native.len(), 1);
+        assert_eq!(proxies.mihomo.len(), 0);
+        match &proxies.native[0] {
+            ProxyNode::Https {
+                addr,
+                auth,
+                sni,
+                skip_cert_verify,
+            } => {
+                assert_eq!(addr.host, "proxy.example.com");
+                assert_eq!(addr.port, 443);
+                assert_eq!(auth.as_ref().unwrap().username, "user");
+                assert_eq!(sni.as_deref(), Some("tls.example.com"));
+                assert!(*skip_cert_verify);
+            }
+            other => panic!("unexpected proxy: {other:?}"),
+        }
+    }
+
+    #[test]
     fn sends_complex_clash_nodes_to_complex_queue() {
         let yaml = r#"
 proxies:
@@ -1829,6 +1994,51 @@ proxies:
                 assert_eq!(proxy.kind, "anytls");
                 let text = serde_yaml::to_string(&proxy.value).unwrap();
                 assert!(text.contains("password: pass"));
+            }
+            ParsedProxyLine::Native(_) => panic!("expected complex node"),
+        }
+    }
+
+    #[test]
+    fn parses_hysteria2_link_with_obfs_and_port_hopping() {
+        let parsed = parse_proxy_line(
+            "hysteria2://pass@example.com/?insecure=1&sni=www.microsoft.com&mport=50000-50080&obfs=salamander&obfs-password=secret&upmbps=11&downmbps=55#hy2-a",
+        )
+        .unwrap()
+        .unwrap();
+
+        match parsed {
+            ParsedProxyLine::Mihomo(proxy) => {
+                assert_eq!(proxy.name, "hy2-a");
+                assert_eq!(proxy.kind, "hysteria2");
+                let text = serde_yaml::to_string(&proxy.value).unwrap();
+                assert!(text.contains("port: 50000"));
+                assert!(text.contains("ports: 50000-50080"));
+                assert!(text.contains("obfs: salamander"));
+                assert!(text.contains("obfs-password: secret"));
+                assert!(text.contains("up-mbps: '11'"));
+                assert!(text.contains("down-mbps: '55'"));
+            }
+            ParsedProxyLine::Native(_) => panic!("expected complex node"),
+        }
+    }
+
+    #[test]
+    fn parses_hysteria_v1_link_as_complex_node() {
+        let parsed = parse_proxy_line(
+            "hysteria://163.172.117.163:36699?alpn=h3&auth=dongtaiwang.com&downmbps=55&insecure=1&protocol=udp&upmbps=11#hy-a",
+        )
+        .unwrap()
+        .unwrap();
+
+        match parsed {
+            ParsedProxyLine::Mihomo(proxy) => {
+                assert_eq!(proxy.name, "hy-a");
+                assert_eq!(proxy.kind, "hysteria");
+                let text = serde_yaml::to_string(&proxy.value).unwrap();
+                assert!(text.contains("auth: dongtaiwang.com"));
+                assert!(text.contains("protocol: udp"));
+                assert!(text.contains("skip-cert-verify: true"));
             }
             ParsedProxyLine::Native(_) => panic!("expected complex node"),
         }

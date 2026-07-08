@@ -316,7 +316,9 @@ fn build_hysteria2(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> 
     let server = required_string(mapping, &["server"], &name)?;
     let port = required_port(mapping, &["port"], &name)?;
     let password = required_string(mapping, &["password", "auth"], &name)?;
-    let obfs = string_field(mapping, &["obfs"]).map(|value| value.to_ascii_lowercase());
+    let obfs = string_field(mapping, &["obfs"])
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
     let options = Hy2Options {
         name: name.clone(),
         server: server.clone(),
@@ -326,15 +328,16 @@ fn build_hysteria2(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> 
         skip_cert_verify: bool_field(mapping, &["skip-cert-verify", "allow-insecure"])
             .unwrap_or(false),
         udp: bool_field(mapping, &["udp"]).unwrap_or(false),
-        up_bps: u64_field(mapping, &["up", "up-mbps"]).unwrap_or(0),
-        down_bps: u64_field(mapping, &["down", "down-mbps"]).unwrap_or(0),
+        up_bps: hy_bandwidth_bps(mapping, &["up", "up-mbps", "upmbps", "up_mbps"]).unwrap_or(0),
+        down_bps: hy_bandwidth_bps(mapping, &["down", "down-mbps", "downmbps", "down_mbps"])
+            .unwrap_or(0),
         obfs: match obfs.as_deref() {
             Some("salamander") => Some(Hy2Obfs::Salamander),
             Some(other) => bail!("不支持的 Hysteria2 obfs：{other}"),
             None => None,
         },
-        obfs_password: string_field(mapping, &["obfs-password"]),
-        ports: string_field(mapping, &["ports"]),
+        obfs_password: string_field(mapping, &["obfs-password", "obfs_password"]),
+        ports: string_field(mapping, &["ports", "mport"]),
         hop_interval: parse_hy2_hop_interval(mapping),
         fingerprint: string_field(mapping, &["pinSHA256", "fingerprint"]),
         fast_open: bool_field(mapping, &["fast-open"]).unwrap_or(false),
@@ -592,12 +595,41 @@ fn validate_tls_server_name(value: &str) -> Result<()> {
 }
 
 fn parse_hy2_hop_interval(mapping: &serde_yaml::Mapping) -> Option<Hy2HopInterval> {
-    let raw = string_field(mapping, &["hop-interval"])?;
+    let raw = string_field(mapping, &["hop-interval", "hop_interval"])?;
     let (min, max) = raw.split_once('-')?;
     Some(Hy2HopInterval {
         min_secs: min.parse().ok()?,
         max_secs: max.parse().ok()?,
     })
+}
+
+fn hy_bandwidth_bps(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        let raw = get(mapping, key)?;
+        let raw = value_to_string(raw)?;
+        parse_hy_bandwidth(&raw, key)
+    })
+}
+
+fn parse_hy_bandwidth(value: &str, key: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let digits: String = value.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    let number = digits.parse::<u64>().ok()?;
+    let suffix = value[digits.len()..].trim().to_ascii_lowercase();
+    if key.contains("mbps") {
+        return Some(number.saturating_mul(1_000_000));
+    }
+    match suffix.as_str() {
+        "" => Some(number),
+        "b" | "bps" => Some(number),
+        "k" | "kb" | "kbps" => Some(number.saturating_mul(1_000)),
+        "m" | "mb" | "mbps" => Some(number.saturating_mul(1_000_000)),
+        "g" | "gb" | "gbps" => Some(number.saturating_mul(1_000_000_000)),
+        _ => None,
+    }
 }
 
 fn parse_snell_obfs(mapping: &serde_yaml::Mapping, server: &str) -> Result<SnellObfs> {
@@ -766,10 +798,6 @@ fn bool_field_in(mapping: Option<&serde_yaml::Mapping>, keys: &[&str]) -> Option
 fn u16_field(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<u16> {
     keys.iter()
         .find_map(|key| value_to_u64(get(mapping, key)?).and_then(|value| value.try_into().ok()))
-}
-
-fn u64_field(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| value_to_u64(get(mapping, key)?))
 }
 
 fn usize_field_in(mapping: Option<&serde_yaml::Mapping>, keys: &[&str]) -> Option<usize> {
@@ -977,6 +1005,61 @@ server: example.com
 port: 443
 password: pass
 sni: t.me%2Fripaojiedian
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 0);
+        assert_eq!(result.fallback.len(), 1);
+    }
+
+    #[test]
+    fn builds_hysteria2_with_empty_obfs_and_aliases() {
+        let proxy = complex(
+            r#"
+name: hy2-empty-obfs
+type: hysteria2
+server: example.com
+port: 443
+password: pass
+obfs: ""
+obfs_password: secret
+mport: 443-445
+upmbps: 11
+downmbps: 55
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
+        assert_eq!(result.nodes[0].label(), "meow:hysteria2:hy2-empty-obfs");
+    }
+
+    #[test]
+    fn hysteria_v1_still_reports_unsupported_native_adapter() {
+        let proxy = complex(
+            r#"
+name: hy1
+type: hysteria
+server: example.com
+port: 443
+auth: pass
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 0);
+        assert_eq!(result.fallback.len(), 1);
+    }
+
+    #[test]
+    fn mieru_still_reports_unsupported_native_adapter() {
+        let proxy = complex(
+            r#"
+name: mieru-a
+type: mieru
+server: example.com
+port: 443
+username: user
+password: pass
 "#,
         );
         let result = build_meow_nodes(vec![proxy]);

@@ -117,15 +117,15 @@ proxies:
 
 当整个文件内容或订阅响应体是 Base64 编码的文本时，RotatorProxy 会自动解码，并按同样的行格式或 Clash YAML 格式继续解析。
 
-常见 URI 风格复杂链接，例如 `vmess://`、`vless://`、`trojan://`、`hysteria2://`、`hy2://`、`anytls://`、`ssr://`、`tuic://`，会被转换成 Clash 风格节点对象。完整 Clash YAML 仍然是最完整的输入格式，因为未知字段和协议特定字段会被保留下来，供原生构建器判断是否支持。
+常见 URI 风格复杂链接，例如 `vmess://`、`vless://`、`trojan://`、`hysteria://`、`hysteria2://`、`hy2://`、`anytls://`、`ssr://`、`tuic://`，会被转换成 Clash 风格节点对象。完整 Clash YAML 仍然是最完整的输入格式，因为未知字段和协议特定字段会被保留下来，供原生构建器判断是否支持。
 
 ## Clash 兼容节点
 
-RotatorProxy 在进程内处理常见 TCP 代理协议。简单协议使用本地实现：HTTP、HTTPS、SOCKS4/5 和普通 Shadowsocks。复杂 Clash 兼容节点会优先交给内嵌 `meow-proxy` 后端构建。目前该路径覆盖 VMess、VLESS、Trojan、Trojan over WebSocket/HTTPUpgrade/gRPC/H2、Hysteria2/Hy2、Snell、AnyTLS、Reality TLS、uTLS/client-fingerprint 配置，以及带受支持内置插件的 Shadowsocks。VLESS 的 `xtls-rprx-vision-*` 后缀会按 TCP 场景归一化为 `xtls-rprx-vision`。
+RotatorProxy 在进程内处理常见 TCP 代理协议。简单协议使用本地实现：HTTP、HTTPS CONNECT、SOCKS4/5 和普通 Shadowsocks。Clash 中 `type: http` 且 `tls: true` 的节点会作为 HTTPS CONNECT 代理处理。复杂 Clash 兼容节点会优先交给内嵌 `meow-proxy` 后端构建。目前该路径覆盖 VMess、VLESS、Trojan、Trojan over WebSocket/HTTPUpgrade/gRPC/H2、Hysteria2/Hy2、Snell、AnyTLS、Reality TLS、uTLS/client-fingerprint 配置，以及带受支持内置插件的 Shadowsocks。Hysteria2/Hy2 会兼容常见 `mport`/`ports`、`obfs`、`obfs-password`/`obfs_password`、`upmbps`/`downmbps` 字段；空 `obfs` 会按未启用混淆处理。VLESS 的 `xtls-rprx-vision-*` 后缀会按 TCP 场景归一化为 `xtls-rprx-vision`。
 
 Reality 和真实 uTLS/client-fingerprint 支持使用 `meow-transport` 的 BoringSSL TLS 路径，仍在 Rust 进程内完成。此类节点不需要外部 Mihomo 二进制，但 Linux 构建需要 `boring-sys` 所需的常规原生工具链。
 
-当节点使用内嵌后端无法可靠复现的字段或协议时，例如 TUIC、WireGuard/WG、Mieru、SSH、SSR、旧版 VMess `alterId` 或 XHTTP，该节点会被记录日志并跳过。Mihomo fallback 当前已停用，不会启动、下载或管理外部 Mihomo 进程。
+当节点使用内嵌后端无法可靠复现的字段或协议时，例如 Hysteria v1、Mieru、TUIC、WireGuard/WG、SSH、SSR、旧版 VMess `alterId` 或 XHTTP，该节点会被记录日志并跳过。Hysteria v1 与 Mieru 当前只会被解析进复杂节点队列，原生拨号仍需要专门的协议实现或可复用客户端库；Mihomo fallback 当前已停用，不会启动、下载或管理外部 Mihomo 进程。
 
 历史 Mihomo 配置项暂时保留以兼容已有配置文件，但当前刷新流程不会使用这些配置项。
 
