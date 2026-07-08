@@ -28,6 +28,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
+    hysteria::{HysteriaAdapter, HysteriaOptions},
     parser::MihomoProxyConfig,
     proxy::{MeowProxyNode, ProxyNode},
 };
@@ -218,6 +219,7 @@ fn build_meow_node(proxy: &MihomoProxyConfig) -> Result<ProxyNode> {
         "vmess" => build_vmess(proxy, mapping),
         "vless" => build_vless(proxy, mapping),
         "trojan" => build_trojan(proxy, mapping),
+        "hysteria" => build_hysteria(proxy, mapping),
         "hysteria2" | "hy2" => build_hysteria2(proxy, mapping),
         "snell" => build_snell(proxy, mapping),
         "anytls" => build_anytls(proxy, mapping),
@@ -308,6 +310,40 @@ fn build_trojan(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Res
         bool_field(mapping, &["skip-cert-verify", "allow-insecure"]).unwrap_or(false),
         bool_field(mapping, &["udp"]).unwrap_or(false),
     );
+    Ok(meow_node(proxy, name, server, port, Arc::new(adapter)))
+}
+
+fn build_hysteria(proxy: &MihomoProxyConfig, mapping: &serde_yaml::Mapping) -> Result<ProxyNode> {
+    let name = node_name(proxy, mapping);
+    let server = required_string(mapping, &["server"], &name)?;
+    let port = required_port(mapping, &["port"], &name)?;
+    let auth = required_string(mapping, &["auth", "password"], &name)?;
+    let protocol = string_field(mapping, &["protocol"])
+        .unwrap_or_else(|| "udp".to_owned())
+        .to_ascii_lowercase();
+    if !matches!(protocol.as_str(), "" | "udp") {
+        bail!("Hysteria v1 原生暂不支持 protocol={protocol}");
+    }
+    let adapter = HysteriaAdapter::new(HysteriaOptions {
+        name: name.clone(),
+        server: server.clone(),
+        port,
+        auth: auth.into_bytes(),
+        sni: string_field(mapping, &["sni", "servername"]),
+        alpn: string_field(mapping, &["alpn"])
+            .and_then(|alpn| alpn.split(',').next().map(str::to_owned))
+            .filter(|alpn| !alpn.trim().is_empty())
+            .unwrap_or_else(|| "hysteria".to_owned()),
+        skip_cert_verify: bool_field(mapping, &["skip-cert-verify", "allow-insecure"])
+            .unwrap_or(false),
+        up_bps: hy_bandwidth_bps(mapping, &["up", "up-mbps", "upmbps", "up_mbps"]).unwrap_or(0),
+        down_bps: hy_bandwidth_bps(mapping, &["down", "down-mbps", "downmbps", "down_mbps"])
+            .unwrap_or(0),
+        obfs_password: string_field(mapping, &["obfs", "obfs-password", "obfs_password"])
+            .filter(|value| !value.is_empty()),
+        fast_open: bool_field(mapping, &["fast-open"]).unwrap_or(false),
+    })
+    .map_err(|err| anyhow!("{err}"))?;
     Ok(meow_node(proxy, name, server, port, Arc::new(adapter)))
 }
 
@@ -1035,7 +1071,7 @@ downmbps: 55
     }
 
     #[test]
-    fn hysteria_v1_still_reports_unsupported_native_adapter() {
+    fn builds_hysteria_v1_adapter() {
         let proxy = complex(
             r#"
 name: hy1
@@ -1043,6 +1079,29 @@ type: hysteria
 server: example.com
 port: 443
 auth: pass
+protocol: udp
+alpn:
+  - hysteria
+upmbps: 11
+downmbps: 55
+"#,
+        );
+        let result = build_meow_nodes(vec![proxy]);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.fallback.len(), 0);
+        assert_eq!(result.nodes[0].label(), "meow:hysteria:hy1");
+    }
+
+    #[test]
+    fn hysteria_v1_wechat_protocol_is_not_claimed_as_supported() {
+        let proxy = complex(
+            r#"
+name: hy1-wechat
+type: hysteria
+server: example.com
+port: 443
+auth: pass
+protocol: wechat
 "#,
         );
         let result = build_meow_nodes(vec![proxy]);

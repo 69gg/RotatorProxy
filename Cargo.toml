@@ -9,12 +9,17 @@ license = "GPL-3.0-only"
 anyhow = "1.0.95"
 async-trait = "0.1.89"
 base64 = "0.22.1"
+bytes = "1.10.1"
 chrono = "0.4.40"
 flate2 = "1.0.35"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1.4.0"
 meow-common = "0.16.0"
 meow-proxy = { version = "0.16.0", default-features = false, features = ["ss", "trojan", "vless", "vless-vision", "vmess", "snell", "hysteria2", "anytls"] }
 meow-transport = { version = "0.16.0", features = ["tls", "boring-tls", "ws", "grpc", "h2", "httpupgrade"] }
 percent-encoding = "2.3.1"
+quinn = "0.11.11"
 rand = "0.10"
 reqwest = { version = "0.13.4", features = ["socks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
