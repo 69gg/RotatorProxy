@@ -22,6 +22,7 @@ const DEFAULT_HEALTH_CHECK_EXPECTED_STATUS: &str = "200-399";
 const DEFAULT_HEALTH_CHECK_ATTEMPTS: usize = 3;
 const DEFAULT_HEALTH_CHECK_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_HEALTH_CHECK_CONCURRENCY: usize = 256;
+const DEFAULT_DISABLED_RECHECK_CONCURRENCY: usize = 128;
 const DEFAULT_HEALTH_CHECK_TLS_SKIP_VERIFY: bool = false;
 const DEFAULT_RUNTIME_FAILURE_THRESHOLD: usize = 3;
 const DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS: usize = 2;
@@ -54,6 +55,7 @@ pub struct AppConfig {
     pub health_check_attempts: usize,
     pub health_check_timeout_ms: u64,
     pub health_check_concurrency: usize,
+    pub disabled_recheck_concurrency: usize,
     pub health_check_tls_skip_verify: bool,
     pub runtime_failure_threshold: usize,
     pub runtime_disable_after_cooldowns: usize,
@@ -89,6 +91,7 @@ impl Default for AppConfig {
             health_check_attempts: DEFAULT_HEALTH_CHECK_ATTEMPTS,
             health_check_timeout_ms: DEFAULT_HEALTH_CHECK_TIMEOUT_MS,
             health_check_concurrency: DEFAULT_HEALTH_CHECK_CONCURRENCY,
+            disabled_recheck_concurrency: DEFAULT_DISABLED_RECHECK_CONCURRENCY,
             health_check_tls_skip_verify: DEFAULT_HEALTH_CHECK_TLS_SKIP_VERIFY,
             runtime_failure_threshold: DEFAULT_RUNTIME_FAILURE_THRESHOLD,
             runtime_disable_after_cooldowns: DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS,
@@ -152,6 +155,9 @@ impl AppConfig {
             if self.health_check_concurrency == 0 {
                 bail!("health_check_concurrency 必须大于 0");
             }
+        }
+        if self.disabled_recheck_concurrency == 0 {
+            bail!("disabled_recheck_concurrency 必须大于 0");
         }
         if self.runtime_failure_threshold == 0 {
             bail!("runtime_failure_threshold 必须大于 0");
@@ -395,6 +401,16 @@ proxy_dirs = ["./fixtures"]
             ..AppConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_disabled_recheck_concurrency() {
+        let config = AppConfig {
+            health_check_enabled: false,
+            disabled_recheck_concurrency: 0,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

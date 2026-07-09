@@ -54,6 +54,23 @@ struct HealthyProxy {
     delay: Duration,
 }
 
+#[derive(Debug, Default)]
+struct DisabledRecheckStats {
+    checked: usize,
+    recovered: usize,
+    still_disabled: usize,
+    removed: usize,
+}
+
+impl DisabledRecheckStats {
+    fn add(&mut self, other: Self) {
+        self.checked += other.checked;
+        self.recovered += other.recovered;
+        self.still_disabled += other.still_disabled;
+        self.removed += other.removed;
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct LatencyStats {
     min_ms: u128,
@@ -290,7 +307,10 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
     let attempts = config.health_check_attempts.max(1);
     let timeout_ms = config.health_check_timeout_ms.max(1);
     let timeout = Duration::from_millis(timeout_ms);
-    let worker_count = config.health_check_concurrency.max(1).min(disabled.len());
+    let worker_count = config
+        .disabled_recheck_concurrency
+        .max(1)
+        .min(disabled.len());
     info!(
         reason,
         disabled_nodes = disabled.len(),
@@ -307,14 +327,18 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
     for _ in 0..worker_count {
         let queue = Arc::clone(&queue);
         let target = Arc::clone(&target);
+        let pool = pool.clone();
         checks.spawn(async move {
-            let mut results = Vec::new();
+            let mut stats = DisabledRecheckStats::default();
             loop {
                 let disabled = {
-                    queue
-                        .lock()
-                        .expect("disabled health check queue lock poisoned")
-                        .next()
+                    match queue.lock() {
+                        Ok(mut queue) => queue.next(),
+                        Err(err) => {
+                            warn!("失效代理静默健康检查队列锁已损坏，本任务提前结束：{err}");
+                            break;
+                        }
+                    }
                 };
                 let Some(disabled) = disabled else {
                     break;
@@ -322,75 +346,69 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
                 let healthy = check_proxy_node(&disabled.node, &target, attempts, timeout)
                     .await
                     .is_some();
-                results.push((disabled, healthy));
+                stats.checked += 1;
+                if healthy {
+                    if pool.report_disabled_recheck_success(&disabled.key) {
+                        stats.recovered += 1;
+                        info!(
+                            node = %disabled.label,
+                            kind = disabled.node.kind(),
+                            upstream = %disabled.node.upstream_addr(),
+                            "失效代理静默测活成功，已恢复到轮询池"
+                        );
+                    }
+                    continue;
+                }
+
+                match pool.report_disabled_recheck_failure(&disabled.key) {
+                    DisabledRecheckFailure::StillDisabled {
+                        failures,
+                        threshold,
+                    } => {
+                        stats.still_disabled += 1;
+                        debug!(
+                            node = %disabled.label,
+                            kind = disabled.node.kind(),
+                            upstream = %disabled.node.upstream_addr(),
+                            failures,
+                            threshold,
+                            "失效代理静默测活失败，继续保留在失效名单"
+                        );
+                    }
+                    DisabledRecheckFailure::Removed {
+                        failures,
+                        threshold,
+                    } => {
+                        stats.removed += 1;
+                        warn!(
+                            node = %disabled.label,
+                            kind = disabled.node.kind(),
+                            upstream = %disabled.node.upstream_addr(),
+                            failures,
+                            threshold,
+                            "失效代理连续静默测活失败，已从代理池删除"
+                        );
+                    }
+                    DisabledRecheckFailure::NotDisabled => {}
+                }
             }
-            results
+            stats
         });
     }
 
-    let mut checked = 0;
-    let mut recovered = 0;
-    let mut still_disabled = 0;
-    let mut removed = 0;
+    let mut stats = DisabledRecheckStats::default();
     while let Some(result) = checks.join_next().await {
-        let Ok(results) = result else {
-            warn!("失效代理静默健康检查任务失败");
-            continue;
-        };
-        for (disabled, healthy) in results {
-            checked += 1;
-            if healthy {
-                if pool.report_disabled_recheck_success(&disabled.key) {
-                    recovered += 1;
-                    info!(
-                        node = %disabled.label,
-                        kind = disabled.node.kind(),
-                        upstream = %disabled.node.upstream_addr(),
-                        "失效代理静默测活成功，已恢复到轮询池"
-                    );
-                }
-                continue;
-            }
-
-            match pool.report_disabled_recheck_failure(&disabled.key) {
-                DisabledRecheckFailure::StillDisabled {
-                    failures,
-                    threshold,
-                } => {
-                    still_disabled += 1;
-                    debug!(
-                        node = %disabled.label,
-                        kind = disabled.node.kind(),
-                        upstream = %disabled.node.upstream_addr(),
-                        failures,
-                        threshold,
-                        "失效代理静默测活失败，继续保留在失效名单"
-                    );
-                }
-                DisabledRecheckFailure::Removed {
-                    failures,
-                    threshold,
-                } => {
-                    removed += 1;
-                    warn!(
-                        node = %disabled.label,
-                        kind = disabled.node.kind(),
-                        upstream = %disabled.node.upstream_addr(),
-                        failures,
-                        threshold,
-                        "失效代理连续静默测活失败，已从代理池删除"
-                    );
-                }
-                DisabledRecheckFailure::NotDisabled => {}
-            }
+        match result {
+            Ok(worker_stats) => stats.add(worker_stats),
+            Err(err) => warn!("失效代理静默健康检查任务失败：{err}"),
         }
     }
     info!(
         reason,
-        checked_nodes = checked,
-        recovered_nodes = recovered,
-        still_disabled_nodes = still_disabled,
-        removed_nodes = removed,
+        checked_nodes = stats.checked,
+        recovered_nodes = stats.recovered,
+        still_disabled_nodes = stats.still_disabled,
+        removed_nodes = stats.removed,
         "失效代理静默健康检查完成"
     );
 }
