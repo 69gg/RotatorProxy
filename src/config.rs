@@ -11,6 +11,7 @@ use url::Url;
 const DEFAULT_LISTEN: &str = "127.0.0.1:7890";
 const DEFAULT_MAX_RETRIES: usize = 10;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 256;
 const DEFAULT_SUBSCRIPTION_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const SUPPORTED_SUBSCRIPTION_PROXY_SCHEMES: &[&str] =
@@ -45,6 +46,7 @@ pub struct AppConfig {
     pub proxy_dirs: Vec<PathBuf>,
     pub max_retries: usize,
     pub connect_timeout_ms: u64,
+    pub max_concurrent_connections: usize,
     pub subscription_timeout_ms: u64,
     pub subscription_user_agent: String,
     pub subscription_proxy: Option<String>,
@@ -81,6 +83,7 @@ impl Default for AppConfig {
             proxy_dirs: vec![PathBuf::from("./proxies")],
             max_retries: DEFAULT_MAX_RETRIES,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+            max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
             subscription_timeout_ms: DEFAULT_SUBSCRIPTION_TIMEOUT_MS,
             subscription_user_agent: DEFAULT_USER_AGENT.to_owned(),
             subscription_proxy: None,
@@ -126,6 +129,15 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         if self.connect_timeout_ms == 0 {
             bail!("connect_timeout_ms 必须大于 0");
+        }
+        if self.max_concurrent_connections == 0 {
+            bail!("max_concurrent_connections 必须大于 0");
+        }
+        if self.max_concurrent_connections > tokio::sync::Semaphore::MAX_PERMITS {
+            bail!(
+                "max_concurrent_connections 不能大于 {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            );
         }
         if self.subscription_timeout_ms == 0 {
             bail!("subscription_timeout_ms 必须大于 0");
@@ -313,6 +325,10 @@ proxy_dirs = ["./fixtures"]
         assert_eq!(config.listen, "127.0.0.1:9000");
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
         assert_eq!(
+            config.max_concurrent_connections,
+            DEFAULT_MAX_CONCURRENT_CONNECTIONS
+        );
+        assert_eq!(
             config.health_check_url,
             "http://cp.cloudflare.com/generate_204"
         );
@@ -351,6 +367,15 @@ proxy_dirs = ["./fixtures"]
             ..AppConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_max_concurrent_connections() {
+        let config = AppConfig {
+            max_concurrent_connections: 0,
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -2391,6 +2391,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "http",
+ "libc",
  "meow-common",
  "meow-proxy",
  "meow-transport",

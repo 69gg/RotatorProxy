@@ -5,7 +5,7 @@ use rotator_proxy::{
     AppConfig, HostPort, MihomoManager, ProxyNode, ProxyPool,
     health::{prepare_proxy_refresh, refresh_proxy_pool, spawn_prepared_proxy_refresh},
     outbound::Connector,
-    server::run_listener,
+    server::{run_listener, run_listener_with_limit},
 };
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
@@ -27,6 +27,20 @@ async fn spawn_rotator(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(run_listener(listener, connector));
+    Ok((addr, handle))
+}
+
+async fn spawn_rotator_with_limit(
+    connector: Connector,
+    max_concurrent_connections: usize,
+) -> io::Result<(SocketAddr, JoinHandle<io::Result<()>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(run_listener_with_limit(
+        listener,
+        connector,
+        max_concurrent_connections,
+    ));
     Ok((addr, handle))
 }
 
@@ -264,6 +278,42 @@ async fn forwards_absolute_form_http_request_directly() -> io::Result<()> {
     client.read_to_end(&mut response).await?;
     assert!(String::from_utf8_lossy(&response).contains("200 OK"));
     assert_eq!(first_line_rx.await.unwrap(), "GET /hello?x=1 HTTP/1.1");
+
+    proxy_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_client_limit_applies_backpressure_before_accept() -> io::Result<()> {
+    let (target_addr, first_line_rx, _target_handle) = spawn_http_target().await?;
+    let (proxy_addr, proxy_handle) = spawn_rotator_with_limit(direct_connector(), 1).await?;
+
+    let first_client = TcpStream::connect(proxy_addr).await?;
+    sleep(Duration::from_millis(50)).await;
+
+    let mut second_client = TcpStream::connect(proxy_addr).await?;
+    let request =
+        format!("GET http://{target_addr}/limited HTTP/1.1\r\nHost: {target_addr}\r\n\r\n");
+    second_client.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    assert!(
+        timeout(
+            Duration::from_millis(150),
+            second_client.read_to_end(&mut response)
+        )
+        .await
+        .is_err()
+    );
+
+    drop(first_client);
+    timeout(
+        Duration::from_secs(2),
+        second_client.read_to_end(&mut response),
+    )
+    .await
+    .expect("second client should proceed after the first permit is released")?;
+    assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+    assert_eq!(first_line_rx.await.unwrap(), "GET /limited HTTP/1.1");
 
     proxy_handle.abort();
     Ok(())

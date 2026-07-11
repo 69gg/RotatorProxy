@@ -1,6 +1,9 @@
 use std::{
     fmt, io,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -27,6 +30,7 @@ use crate::{
     mihomo::MihomoManager,
     outbound::connect_via_proxy_node,
     proxy::{DisabledRecheckFailure, ProxyNode, ProxyPool, TargetAddr},
+    resource::is_file_descriptor_exhaustion,
 };
 
 const HEALTH_RESPONSE_HEADER_LIMIT: usize = 16 * 1024;
@@ -64,6 +68,18 @@ impl PreparedProxyRefresh {
 struct HealthyProxy {
     proxy: ProxyNode,
     delay: Duration,
+}
+
+enum ProxyHealthCheckResult {
+    Healthy(Duration),
+    Unhealthy,
+    ResourceExhausted(io::Error),
+}
+
+#[derive(Default)]
+struct HealthCheckWorkerResult {
+    active: Vec<HealthyProxy>,
+    checked: usize,
 }
 
 #[derive(Debug, Default)]
@@ -336,6 +352,7 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
     if disabled.is_empty() {
         return;
     }
+    let disabled_total = disabled.len();
 
     let target = match HealthCheckTarget::from_config(config) {
         Ok(target) => Arc::new(target),
@@ -357,7 +374,7 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
         .min(disabled.len());
     info!(
         reason,
-        disabled_nodes = disabled.len(),
+        disabled_nodes = disabled_total,
         target = %target.display,
         expected_status = %target.expected_display,
         attempts,
@@ -367,14 +384,19 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
     );
 
     let queue = Arc::new(Mutex::new(disabled.into_iter()));
+    let stop_checks = Arc::new(AtomicBool::new(false));
     let mut checks = JoinSet::new();
     for _ in 0..worker_count {
         let queue = Arc::clone(&queue);
         let target = Arc::clone(&target);
         let pool = pool.clone();
+        let stop_checks = Arc::clone(&stop_checks);
         checks.spawn(async move {
             let mut stats = DisabledRecheckStats::default();
             loop {
+                if stop_checks.load(Ordering::Relaxed) {
+                    break;
+                }
                 let disabled = {
                     match queue.lock() {
                         Ok(mut queue) => queue.next(),
@@ -387,53 +409,63 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
                 let Some(disabled) = disabled else {
                     break;
                 };
-                let healthy = check_proxy_node(&disabled.node, &target, attempts, timeout)
-                    .await
-                    .is_some();
-                stats.checked += 1;
-                if healthy {
-                    if pool.report_disabled_recheck_success_deferred(&disabled.key) {
-                        stats.recovered += 1;
-                        info!(
-                            node = %disabled.label,
-                            kind = disabled.node.kind(),
-                            upstream = %disabled.node.upstream_addr(),
-                            "失效代理静默测活成功，已恢复到轮询池"
-                        );
+                match check_proxy_node(&disabled.node, &target, attempts, timeout).await {
+                    ProxyHealthCheckResult::Healthy(_) => {
+                        stats.checked += 1;
+                        if pool.report_disabled_recheck_success_deferred(&disabled.key) {
+                            stats.recovered += 1;
+                            info!(
+                                node = %disabled.label,
+                                kind = disabled.node.kind(),
+                                upstream = %disabled.node.upstream_addr(),
+                                "失效代理静默测活成功，已恢复到轮询池"
+                            );
+                        }
                     }
-                    continue;
-                }
-
-                match pool.report_disabled_recheck_failure_deferred(&disabled.key) {
-                    DisabledRecheckFailure::StillDisabled {
-                        failures,
-                        threshold,
-                    } => {
-                        stats.still_disabled += 1;
-                        debug!(
-                            node = %disabled.label,
-                            kind = disabled.node.kind(),
-                            upstream = %disabled.node.upstream_addr(),
-                            failures,
-                            threshold,
-                            "失效代理静默测活失败，继续保留在失效名单"
-                        );
+                    ProxyHealthCheckResult::Unhealthy => {
+                        stats.checked += 1;
+                        match pool.report_disabled_recheck_failure_deferred(&disabled.key) {
+                            DisabledRecheckFailure::StillDisabled {
+                                failures,
+                                threshold,
+                            } => {
+                                stats.still_disabled += 1;
+                                debug!(
+                                    node = %disabled.label,
+                                    kind = disabled.node.kind(),
+                                    upstream = %disabled.node.upstream_addr(),
+                                    failures,
+                                    threshold,
+                                    "失效代理静默测活失败，继续保留在失效名单"
+                                );
+                            }
+                            DisabledRecheckFailure::Removed {
+                                failures,
+                                threshold,
+                            } => {
+                                stats.removed += 1;
+                                warn!(
+                                    node = %disabled.label,
+                                    kind = disabled.node.kind(),
+                                    upstream = %disabled.node.upstream_addr(),
+                                    failures,
+                                    threshold,
+                                    "失效代理连续静默测活失败，已从代理池删除"
+                                );
+                            }
+                            DisabledRecheckFailure::NotDisabled => {}
+                        }
                     }
-                    DisabledRecheckFailure::Removed {
-                        failures,
-                        threshold,
-                    } => {
-                        stats.removed += 1;
-                        warn!(
-                            node = %disabled.label,
-                            kind = disabled.node.kind(),
-                            upstream = %disabled.node.upstream_addr(),
-                            failures,
-                            threshold,
-                            "失效代理连续静默测活失败，已从代理池删除"
-                        );
+                    ProxyHealthCheckResult::ResourceExhausted(err) => {
+                        if !stop_checks.swap(true, Ordering::Relaxed) {
+                            warn!(
+                                node = %disabled.label,
+                                error = %err,
+                                "本机文件描述符已耗尽，本轮失效代理静默测活提前停止；未完成节点不会累计失败"
+                            );
+                        }
+                        break;
                     }
-                    DisabledRecheckFailure::NotDisabled => {}
                 }
             }
             stats
@@ -448,9 +480,11 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
         }
     }
     flush_pool_state(pool).await;
+    let skipped_nodes = disabled_total.saturating_sub(stats.checked);
     info!(
         reason,
         checked_nodes = stats.checked,
+        skipped_nodes,
         recovered_nodes = stats.recovered,
         still_disabled_nodes = stats.still_disabled,
         removed_nodes = stats.removed,
@@ -601,14 +635,19 @@ async fn health_check_proxies(
         "批量健康检查开始"
     );
     let queue = Arc::new(Mutex::new(proxies.into_iter()));
+    let stop_checks = Arc::new(AtomicBool::new(false));
     let mut checks = JoinSet::new();
 
     for _ in 0..worker_count {
         let queue = Arc::clone(&queue);
         let target = Arc::clone(&target);
+        let stop_checks = Arc::clone(&stop_checks);
         checks.spawn(async move {
-            let mut active = Vec::new();
+            let mut result = HealthCheckWorkerResult::default();
             loop {
+                if stop_checks.load(Ordering::Relaxed) {
+                    break;
+                }
                 let proxy = {
                     queue
                         .lock()
@@ -620,38 +659,59 @@ async fn health_check_proxies(
                 };
 
                 let label = proxy.label();
-                if let Some(delay) = check_proxy_node(&proxy, &target, attempts, timeout).await {
-                    debug!(
-                        node = %label,
-                        delay_ms = delay.as_millis(),
-                        "代理节点已加入活动代理池"
-                    );
-                    active.push(HealthyProxy { proxy, delay });
-                } else {
-                    debug!(node = %label, "代理节点未通过健康检查");
+                match check_proxy_node(&proxy, &target, attempts, timeout).await {
+                    ProxyHealthCheckResult::Healthy(delay) => {
+                        result.checked += 1;
+                        debug!(
+                            node = %label,
+                            delay_ms = delay.as_millis(),
+                            "代理节点已加入活动代理池"
+                        );
+                        result.active.push(HealthyProxy { proxy, delay });
+                    }
+                    ProxyHealthCheckResult::Unhealthy => {
+                        result.checked += 1;
+                        debug!(node = %label, "代理节点未通过健康检查");
+                    }
+                    ProxyHealthCheckResult::ResourceExhausted(err) => {
+                        if !stop_checks.swap(true, Ordering::Relaxed) {
+                            warn!(
+                                node = %label,
+                                error = %err,
+                                "本机文件描述符已耗尽，本轮批量健康检查提前停止"
+                            );
+                        }
+                        break;
+                    }
                 }
             }
-            active
+            result
         });
     }
 
     let mut active: Vec<HealthyProxy> = Vec::new();
+    let mut checked = 0_usize;
     while let Some(result) = checks.join_next().await {
         match result {
-            Ok(mut worker_active) => active.append(&mut worker_active),
+            Ok(mut worker_result) => {
+                checked += worker_result.checked;
+                active.append(&mut worker_result.active);
+            }
             Err(err) => warn!("健康检查任务失败：{err}"),
         }
     }
 
     active.sort_by_key(|result| result.delay);
+    let unchecked = total.saturating_sub(checked);
     let stats = latency_stats(&active);
     if let Some(stats) = stats {
         info!(
             target = %target.display,
             expected_status = %target.expected_display,
-            checked_nodes = total,
+            checked_nodes = checked,
+            unchecked_nodes = unchecked,
             active_nodes = active.len(),
-            rejected_nodes = total.saturating_sub(active.len()),
+            rejected_nodes = checked.saturating_sub(active.len()),
             concurrency = worker_count,
             min_delay_ms = stats.min_ms,
             p50_delay_ms = stats.p50_ms,
@@ -663,9 +723,10 @@ async fn health_check_proxies(
         info!(
             target = %target.display,
             expected_status = %target.expected_display,
-            checked_nodes = total,
+            checked_nodes = checked,
+            unchecked_nodes = unchecked,
             active_nodes = 0,
-            rejected_nodes = total,
+            rejected_nodes = checked,
             concurrency = worker_count,
             "批量健康检查完成"
         );
@@ -698,11 +759,18 @@ async fn check_proxy_node(
     target: &HealthCheckTarget,
     attempts: usize,
     timeout: Duration,
-) -> Option<Duration> {
+) -> ProxyHealthCheckResult {
     let label = proxy.label();
+    let probe = match proxy.isolated_health_probe() {
+        Ok(probe) => probe,
+        Err(err) => {
+            debug!(node = %label, "构建隔离健康探测适配器失败：{err:#}");
+            return ProxyHealthCheckResult::Unhealthy;
+        }
+    };
     let mut last_error = None;
     for attempt in 1..=attempts {
-        match run_health_check(proxy, target, timeout).await {
+        match run_health_check(&probe, target, timeout).await {
             Ok(delay) => {
                 if attempt == 1 {
                     debug!(
@@ -720,9 +788,12 @@ async fn check_proxy_node(
                         "代理重试后健康检查通过"
                     );
                 }
-                return Some(delay);
+                return ProxyHealthCheckResult::Healthy(delay);
             }
             Err(err) => {
+                if is_file_descriptor_exhaustion(&err) {
+                    return ProxyHealthCheckResult::ResourceExhausted(err);
+                }
                 debug!(
                     node = %label,
                     target = %target.display,
@@ -743,7 +814,7 @@ async fn check_proxy_node(
             .map(ToString::to_string)
             .unwrap_or_else(|| "未知错误".to_owned())
     );
-    None
+    ProxyHealthCheckResult::Unhealthy
 }
 
 async fn run_health_check(

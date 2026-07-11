@@ -19,7 +19,10 @@ use shadowsocks::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{meow::build_meow_nodes, parser::MihomoProxyConfig};
+use crate::{
+    meow::{build_meow_node, build_meow_nodes},
+    parser::MihomoProxyConfig,
+};
 
 const FAILURE_SHARDS: usize = 64;
 const DEFAULT_RUNTIME_DISABLE_AFTER_COOLDOWNS: usize = 2;
@@ -119,6 +122,27 @@ impl ProxyNode {
             Self::Shadowsocks { .. } => "shadowsocks",
             Self::LocalMihomo { .. } => "mihomo",
             Self::Meow(node) => meow_adapter_kind(node.adapter.adapter_type()),
+        }
+    }
+
+    pub(crate) fn isolated_health_probe(&self) -> Result<Self> {
+        match self {
+            Self::Meow(node) => build_meow_node(&node.source),
+            _ => Ok(self.clone()),
+        }
+    }
+
+    pub(crate) fn connection_scoped_clone(&self) -> Result<Option<Self>> {
+        match self {
+            Self::Meow(node)
+                if matches!(
+                    node.adapter.adapter_type(),
+                    AdapterType::Hysteria2 | AdapterType::Anytls | AdapterType::Snell
+                ) =>
+            {
+                build_meow_node(&node.source).map(Some)
+            }
+            _ => Ok(None),
         }
     }
 

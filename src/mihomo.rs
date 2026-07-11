@@ -30,6 +30,7 @@ use crate::{
     config::AppConfig,
     parser::{MihomoProxyConfig, SubscriptionOptions, build_subscription_client},
     proxy::{HostPort, ProxyNode},
+    resource::is_file_descriptor_exhaustion,
 };
 
 const LOCAL_LISTEN_HOST: &str = "127.0.0.1";
@@ -100,7 +101,7 @@ impl MihomoManager {
             let batch = &proxies[offset..end];
             let reserved_ports = match reserve_local_ports(batch.len()) {
                 Ok(listeners) => listeners,
-                Err(err) if batch.len() > 1 && is_too_many_open_files(&err) => {
+                Err(err) if batch.len() > 1 && is_file_descriptor_exhaustion(&err) => {
                     active_batch_size = (batch.len() / 2).max(1);
                     warn!(
                         requested_nodes = batch.len(),
@@ -458,10 +459,6 @@ fn reserve_local_ports(count: usize) -> io::Result<Vec<StdTcpListener>> {
         listeners.push(listener);
     }
     Ok(listeners)
-}
-
-fn is_too_many_open_files(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(24) || err.to_string().contains("Too many open files")
 }
 
 async fn ensure_mihomo_binary(config: &AppConfig) -> Result<PathBuf> {

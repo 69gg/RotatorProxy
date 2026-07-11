@@ -15,6 +15,7 @@ flate2 = "1.0.35"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1.4.0"
+libc = "0.2.186"
 meow-common = "0.16.0"
 meow-proxy = { version = "0.16.0", default-features = false, features = ["ss", "trojan", "vless", "vless-vision", "vmess", "snell", "hysteria2", "anytls"] }
 meow-transport = { version = "0.16.0", features = ["tls", "boring-tls", "ws", "grpc", "h2", "httpupgrade"] }

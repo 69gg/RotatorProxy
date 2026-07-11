@@ -18,6 +18,11 @@ max_retries = 10
 # Timeout for connecting to a target or outbound proxy.
 connect_timeout_ms = 10000
 
+# Maximum number of client connections handled concurrently. The listener
+# applies backpressure before accept() so inbound traffic cannot consume an
+# unbounded number of file descriptors.
+max_concurrent_connections = 256
+
 # Timeout for fetching subscription URLs found in proxy source files.
 subscription_timeout_ms = 15000
 

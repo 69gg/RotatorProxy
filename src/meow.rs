@@ -210,7 +210,7 @@ pub fn build_meow_nodes(proxies: Vec<MihomoProxyConfig>) -> MeowBuildResult {
     MeowBuildResult { nodes, fallback }
 }
 
-fn build_meow_node(proxy: &MihomoProxyConfig) -> Result<ProxyNode> {
+pub(crate) fn build_meow_node(proxy: &MihomoProxyConfig) -> Result<ProxyNode> {
     let mapping = proxy_mapping(proxy)?;
     let kind = string_field(mapping, &["type"])
         .unwrap_or_else(|| proxy.kind.clone())
@@ -949,6 +949,7 @@ sni: example.com
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.fallback.len(), 0);
         assert_eq!(result.nodes[0].label(), "meow:anytls:anytls-a");
+        assert!(result.nodes[0].connection_scoped_clone().unwrap().is_some());
     }
 
     #[test]
@@ -1156,6 +1157,12 @@ downmbps: 55
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.fallback.len(), 0);
         assert_eq!(result.nodes[0].label(), "meow:hysteria2:hy2-empty-obfs");
+        let probe = result.nodes[0].isolated_health_probe().unwrap();
+        let (ProxyNode::Meow(original), ProxyNode::Meow(probe)) = (&result.nodes[0], &probe) else {
+            panic!("expected meow nodes");
+        };
+        assert!(!Arc::ptr_eq(&original.adapter, &probe.adapter));
+        assert!(result.nodes[0].connection_scoped_clone().unwrap().is_some());
     }
 
     #[test]

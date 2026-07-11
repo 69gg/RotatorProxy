@@ -1,15 +1,19 @@
-use std::{io, str, sync::Arc};
+use std::{io, str, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
+    time::sleep,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::{outbound::Connector, proxy::TargetAddr};
+use crate::{outbound::Connector, proxy::TargetAddr, resource::is_file_descriptor_exhaustion};
 
 const HTTP_REQUEST_HEADER_LIMIT: usize = 64 * 1024;
+const ACCEPT_ERROR_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+const ACCEPT_ERROR_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub async fn run(listen: &str, connector: Connector) -> io::Result<()> {
     let listener = TcpListener::bind(listen).await?;
@@ -17,22 +21,65 @@ pub async fn run(listen: &str, connector: Connector) -> io::Result<()> {
 }
 
 pub async fn run_listener(listener: TcpListener, connector: Connector) -> io::Result<()> {
+    run_listener_with_limit(listener, connector, Semaphore::MAX_PERMITS).await
+}
+
+pub async fn run_listener_with_limit(
+    listener: TcpListener,
+    connector: Connector,
+    max_concurrent_connections: usize,
+) -> io::Result<()> {
+    if max_concurrent_connections == 0 || max_concurrent_connections > Semaphore::MAX_PERMITS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("入站连接并发上限必须在 1..={} 之间", Semaphore::MAX_PERMITS),
+        ));
+    }
     let local_addr = listener.local_addr()?;
     let connector = Arc::new(connector);
+    let connection_limit = Arc::new(Semaphore::new(max_concurrent_connections));
     info!(
-        "RotatorProxy 正在监听 {local_addr}，已加载 {} 个代理",
-        connector.proxy_count()
+        loaded_nodes = connector.proxy_count(),
+        max_concurrent_connections, "RotatorProxy 正在监听 {local_addr}"
     );
 
+    let mut retry_delay = ACCEPT_ERROR_INITIAL_RETRY_DELAY;
     loop {
-        let (socket, peer) = listener.accept().await?;
+        let permit = Arc::clone(&connection_limit)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("入站连接并发限制器已关闭"))?;
+        let (socket, peer) = match listener.accept().await {
+            Ok(accepted) => {
+                retry_delay = ACCEPT_ERROR_INITIAL_RETRY_DELAY;
+                accepted
+            }
+            Err(err) => {
+                warn!(
+                    error_kind = ?err.kind(),
+                    error = %err,
+                    resource_exhausted = is_file_descriptor_exhaustion(&err),
+                    retry_ms = retry_delay.as_millis(),
+                    "接受客户端连接失败，将在退避后继续监听"
+                );
+                drop(permit);
+                sleep(retry_delay).await;
+                retry_delay = next_accept_retry_delay(retry_delay);
+                continue;
+            }
+        };
         let connector = Arc::clone(&connector);
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) = handle_client(socket, connector).await {
                 debug!("客户端 {peer} 处理结束并返回错误：{err}");
             }
         });
     }
+}
+
+fn next_accept_retry_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(ACCEPT_ERROR_MAX_RETRY_DELAY)
 }
 
 async fn handle_client(socket: TcpStream, connector: Arc<Connector>) -> io::Result<()> {
@@ -389,5 +436,27 @@ mod tests {
     fn finds_header_case_insensitively() {
         let headers = ["hOsT: example.com"];
         assert_eq!(find_header(&headers, "host"), Some("example.com"));
+    }
+
+    #[test]
+    fn accept_retry_delay_is_capped() {
+        let mut delay = ACCEPT_ERROR_INITIAL_RETRY_DELAY;
+        for _ in 0..16 {
+            delay = next_accept_retry_delay(delay);
+        }
+        assert_eq!(delay, ACCEPT_ERROR_MAX_RETRY_DELAY);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_connection_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector = Connector::new(
+            crate::proxy::ProxyPool::new(Vec::new(), 1),
+            Duration::from_secs(1),
+        );
+        let err = run_listener_with_limit(listener, connector, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

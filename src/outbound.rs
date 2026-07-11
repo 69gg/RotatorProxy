@@ -8,7 +8,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use meow_common::{ConnType, Metadata, Network};
+use meow_common::{ConnType, MeowError, Metadata, Network};
 use rustls::{
     DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -27,7 +27,10 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
-use crate::proxy::{Credentials, HostPort, ProxyChoice, ProxyNode, ProxyPool, TargetAddr};
+use crate::{
+    proxy::{Credentials, HostPort, ProxyChoice, ProxyNode, ProxyPool, TargetAddr},
+    resource::{file_descriptor_exhaustion_from_message, is_file_descriptor_exhaustion},
+};
 
 const HTTP_CONNECT_RESPONSE_LIMIT: usize = 16 * 1024;
 static HTTPS_PROXY_TLS: OnceLock<TlsConnector> = OnceLock::new();
@@ -38,6 +41,39 @@ pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub type BoxedStream = Box<dyn AsyncStream>;
+
+struct ConnectionScopedStream {
+    inner: BoxedStream,
+    _owner: ProxyNode,
+}
+
+impl AsyncRead for ConnectionScopedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ConnectionScopedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
 
 pub struct Connector {
     pool: ProxyPool,
@@ -107,6 +143,13 @@ impl Connector {
                         error = %err,
                         "出站连接尝试失败"
                     );
+                    if is_file_descriptor_exhaustion(&err) {
+                        warn!(
+                            target = %target,
+                            "本机文件描述符已耗尽，本次出站连接停止重试且不会给代理记录失败"
+                        );
+                        return Err(err);
+                    }
                     self.pool.report_failure(&choice);
                     last_error = Some(err);
                 }
@@ -387,13 +430,38 @@ async fn connect_proxy_node(
         }
         ProxyNode::LocalMihomo { addr, .. } => connect_http_proxy(addr, None, target).await,
         ProxyNode::Meow(node) => {
+            let owner = proxy
+                .connection_scoped_clone()
+                .map_err(|err| io::Error::other(format!("重建连接级 meow 适配器失败：{err:#}")))?;
+            let dial_node = match owner.as_ref() {
+                Some(ProxyNode::Meow(node)) => node,
+                _ => node,
+            };
             let metadata = metadata_from_target(target);
-            let stream = node
+            let stream = dial_node
                 .adapter
                 .dial_tcp(&metadata)
                 .await
-                .map_err(|err| io::Error::other(format!("meow 代理拨号失败：{err}")))?;
-            Ok(Box::new(stream))
+                .map_err(meow_error_to_io)?;
+            let stream: BoxedStream = Box::new(stream);
+            match owner {
+                Some(owner) => Ok(Box::new(ConnectionScopedStream {
+                    inner: stream,
+                    _owner: owner,
+                })),
+                None => Ok(stream),
+            }
+        }
+    }
+}
+
+fn meow_error_to_io(err: MeowError) -> io::Error {
+    match err {
+        MeowError::Io(err) => err,
+        err => {
+            let message = format!("meow 代理拨号失败：{err}");
+            file_descriptor_exhaustion_from_message(&message)
+                .unwrap_or_else(|| io::Error::other(message))
         }
     }
 }
@@ -848,6 +916,17 @@ async fn resolve_ipv4(target: &TargetAddr) -> io::Result<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn meow_errors_preserve_file_descriptor_exhaustion() {
+        let direct = meow_error_to_io(MeowError::Io(io::Error::from_raw_os_error(libc::EMFILE)));
+        assert!(is_file_descriptor_exhaustion(&direct));
+
+        let external = io::Error::from_raw_os_error(libc::ENFILE);
+        let wrapped = meow_error_to_io(MeowError::Proxy(format!("wrapped transport: {external}")));
+        assert!(is_file_descriptor_exhaustion(&wrapped));
+    }
 
     struct ReadErrorStream;
 

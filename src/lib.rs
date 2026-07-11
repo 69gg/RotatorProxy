@@ -6,6 +6,7 @@ pub mod mihomo;
 pub mod outbound;
 pub mod parser;
 pub mod proxy;
+pub(crate) mod resource;
 pub mod server;
 
 pub use config::AppConfig;

@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
         health::spawn_prepared_proxy_refresh(config.clone(), pool.clone(), prepared, "startup");
     let _refresh_handle =
         health::spawn_refresh_scheduler_after(startup_refresh, config.clone(), pool, mihomo);
-    server::run_listener(listener, connector)
+    server::run_listener_with_limit(listener, connector, config.max_concurrent_connections)
         .await
         .with_context(|| format!("代理服务在 {} 上运行失败", config.listen))
 }
