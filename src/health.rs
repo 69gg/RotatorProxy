@@ -49,6 +49,18 @@ pub struct RefreshSummary {
     pub active: usize,
 }
 
+#[derive(Debug)]
+pub struct PreparedProxyRefresh {
+    loaded: usize,
+    candidates: Vec<ProxyNode>,
+}
+
+impl PreparedProxyRefresh {
+    pub fn loaded(&self) -> usize {
+        self.loaded
+    }
+}
+
 struct HealthyProxy {
     proxy: ProxyNode,
     delay: Duration,
@@ -228,6 +240,14 @@ pub async fn refresh_proxy_pool(
     _mihomo: &MihomoManager,
     reason: &str,
 ) -> Result<RefreshSummary> {
+    let prepared = prepare_proxy_refresh(config, reason).await?;
+    apply_prepared_proxy_refresh(config, pool, prepared, reason).await
+}
+
+pub async fn prepare_proxy_refresh(
+    config: &AppConfig,
+    reason: &str,
+) -> Result<PreparedProxyRefresh> {
     info!(reason, "开始重新加载代理来源");
     let loaded_set = load_proxies_from_dirs(config).await?;
     let loaded = loaded_set.total_len();
@@ -258,7 +278,17 @@ pub async fn refresh_proxy_pool(
         );
     }
 
-    recheck_disabled_proxies(config, pool, reason).await;
+    Ok(PreparedProxyRefresh { loaded, candidates })
+}
+
+pub async fn apply_prepared_proxy_refresh(
+    config: &AppConfig,
+    pool: &ProxyPool,
+    prepared: PreparedProxyRefresh,
+    reason: &str,
+) -> Result<RefreshSummary> {
+    let PreparedProxyRefresh { loaded, candidates } = prepared;
+
     let active = select_active_proxies(config, candidates).await?;
     let selected_len = active.len();
     if loaded > 0 && selected_len == 0 {
@@ -271,20 +301,34 @@ pub async fn refresh_proxy_pool(
     }
 
     let merge = pool.merge(active);
+    recheck_disabled_proxies(config, pool, reason).await;
+    let active_nodes = pool.len();
     info!(
         reason,
         loaded_nodes = loaded,
         selected_nodes = selected_len,
         added_nodes = merge.added,
-        active_nodes = merge.active,
+        active_nodes,
         rejected_nodes = loaded.saturating_sub(selected_len),
         "代理刷新完成"
     );
 
     Ok(RefreshSummary {
         loaded,
-        active: merge.active,
+        active: active_nodes,
     })
+}
+
+pub fn spawn_prepared_proxy_refresh(
+    config: AppConfig,
+    pool: ProxyPool,
+    prepared: PreparedProxyRefresh,
+    reason: impl Into<String>,
+) -> JoinHandle<Result<RefreshSummary>> {
+    let reason = reason.into();
+    tokio::spawn(
+        async move { apply_prepared_proxy_refresh(&config, &pool, prepared, &reason).await },
+    )
 }
 
 async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: &str) {
@@ -348,7 +392,7 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
                     .is_some();
                 stats.checked += 1;
                 if healthy {
-                    if pool.report_disabled_recheck_success(&disabled.key) {
+                    if pool.report_disabled_recheck_success_deferred(&disabled.key) {
                         stats.recovered += 1;
                         info!(
                             node = %disabled.label,
@@ -360,7 +404,7 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
                     continue;
                 }
 
-                match pool.report_disabled_recheck_failure(&disabled.key) {
+                match pool.report_disabled_recheck_failure_deferred(&disabled.key) {
                     DisabledRecheckFailure::StillDisabled {
                         failures,
                         threshold,
@@ -403,6 +447,7 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
             Err(err) => warn!("失效代理静默健康检查任务失败：{err}"),
         }
     }
+    flush_pool_state(pool).await;
     info!(
         reason,
         checked_nodes = stats.checked,
@@ -413,40 +458,49 @@ async fn recheck_disabled_proxies(config: &AppConfig, pool: &ProxyPool, reason: 
     );
 }
 
+async fn flush_pool_state(pool: &ProxyPool) {
+    let pool = pool.clone();
+    if let Err(err) = tokio::task::spawn_blocking(move || pool.persist_state()).await {
+        warn!("代理池状态后台保存任务失败：{err}");
+    }
+}
+
 pub fn spawn_refresh_scheduler(
     config: AppConfig,
     pool: ProxyPool,
     mihomo: MihomoManager,
 ) -> JoinHandle<()> {
+    tokio::spawn(run_refresh_scheduler(config, pool, mihomo))
+}
+
+pub fn spawn_refresh_scheduler_after(
+    initial_refresh: JoinHandle<Result<RefreshSummary>>,
+    config: AppConfig,
+    pool: ProxyPool,
+    mihomo: MihomoManager,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Some(interval_seconds) = config.refresh_interval_seconds {
-            let wait = Duration::from_secs(interval_seconds);
-            loop {
-                info!(
-                    refresh_interval_seconds = interval_seconds,
-                    wait_seconds = wait.as_secs(),
-                    "下一次代理刷新已计划"
-                );
-                sleep(wait).await;
-
-                if let Err(err) = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled").await {
-                    error!("定时代理刷新失败，将继续使用上一版活动代理池：{err:#}");
-                }
+        match initial_refresh.await {
+            Ok(Ok(summary)) => info!(
+                loaded_nodes = summary.loaded,
+                active_nodes = summary.active,
+                "启动阶段后台代理刷新完成"
+            ),
+            Ok(Err(err)) => {
+                error!("启动阶段后台代理刷新失败，将继续使用已恢复的代理池：{err:#}")
             }
+            Err(err) => error!("启动阶段后台代理刷新任务异常结束：{err}"),
         }
+        run_refresh_scheduler(config, pool, mihomo).await;
+    })
+}
 
-        let refresh_time = match parse_daily_refresh_time(&config.daily_refresh_time) {
-            Ok(refresh_time) => refresh_time,
-            Err(err) => {
-                error!("每日刷新调度已禁用：{err:#}");
-                return;
-            }
-        };
-
+async fn run_refresh_scheduler(config: AppConfig, pool: ProxyPool, mihomo: MihomoManager) {
+    if let Some(interval_seconds) = config.refresh_interval_seconds {
+        let wait = Duration::from_secs(interval_seconds);
         loop {
-            let wait = duration_until_next_refresh(refresh_time);
             info!(
-                daily_refresh_time = %config.daily_refresh_time,
+                refresh_interval_seconds = interval_seconds,
                 wait_seconds = wait.as_secs(),
                 "下一次代理刷新已计划"
             );
@@ -456,7 +510,29 @@ pub fn spawn_refresh_scheduler(
                 error!("定时代理刷新失败，将继续使用上一版活动代理池：{err:#}");
             }
         }
-    })
+    }
+
+    let refresh_time = match parse_daily_refresh_time(&config.daily_refresh_time) {
+        Ok(refresh_time) => refresh_time,
+        Err(err) => {
+            error!("每日刷新调度已禁用：{err:#}");
+            return;
+        }
+    };
+
+    loop {
+        let wait = duration_until_next_refresh(refresh_time);
+        info!(
+            daily_refresh_time = %config.daily_refresh_time,
+            wait_seconds = wait.as_secs(),
+            "下一次代理刷新已计划"
+        );
+        sleep(wait).await;
+
+        if let Err(err) = refresh_proxy_pool(&config, &pool, &mihomo, "scheduled").await {
+            error!("定时代理刷新失败，将继续使用上一版活动代理池：{err:#}");
+        }
+    }
 }
 
 #[deprecated(note = "改用 spawn_refresh_scheduler，支持按间隔刷新和每日定时刷新")]

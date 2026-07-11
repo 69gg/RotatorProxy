@@ -2,8 +2,10 @@ use std::{collections::HashSet, fs, io, net::SocketAddr, sync::Arc, time::Durati
 
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rotator_proxy::{
-    AppConfig, HostPort, MihomoManager, ProxyNode, ProxyPool, health::refresh_proxy_pool,
-    outbound::Connector, server::run_listener,
+    AppConfig, HostPort, MihomoManager, ProxyNode, ProxyPool,
+    health::{prepare_proxy_refresh, refresh_proxy_pool, spawn_prepared_proxy_refresh},
+    outbound::Connector,
+    server::run_listener,
 };
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
@@ -518,6 +520,46 @@ async fn health_check_timeout_covers_stalled_response() -> io::Result<()> {
 }
 
 #[tokio::test]
+async fn startup_preparation_does_not_wait_for_health_checks() -> io::Result<()> {
+    let (target_addr, _first_line_rx, _target_handle) = spawn_http_target().await?;
+    let (proxy_addr, _proxy_handle) = spawn_stalling_http_connect_proxy().await?;
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_file = dir.path().join("proxies.txt");
+    fs::write(
+        &proxy_file,
+        format!("http://127.0.0.1:{}\n", proxy_addr.port()),
+    )
+    .unwrap();
+    let config = AppConfig {
+        proxy_dirs: vec![dir.path().to_path_buf()],
+        health_check_url: format!("http://{target_addr}/health"),
+        health_check_attempts: 1,
+        health_check_timeout_ms: 1000,
+        health_check_concurrency: 1,
+        mihomo_enabled: false,
+        ..AppConfig::default()
+    };
+    let pool = ProxyPool::with_runtime_options(Vec::new(), 2, 3, Duration::from_secs(60));
+
+    let prepared = timeout(
+        Duration::from_millis(250),
+        prepare_proxy_refresh(&config, "startup"),
+    )
+    .await
+    .expect("startup preparation should only load sources")
+    .unwrap();
+    assert_eq!(prepared.loaded(), 1);
+
+    let refresh = spawn_prepared_proxy_refresh(config, pool.clone(), prepared, "startup");
+    sleep(Duration::from_millis(50)).await;
+
+    assert!(!refresh.is_finished());
+    assert_eq!(labels_from_pool(&pool), vec!["direct"]);
+    refresh.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn scheduled_refresh_keeps_previous_pool_when_all_new_nodes_fail() -> io::Result<()> {
     let bad_port = unused_local_port().await?;
 
@@ -604,6 +646,7 @@ async fn disabled_node_rechecks_even_when_health_precheck_is_disabled() -> io::R
     };
     let dir = tempfile::tempdir().unwrap();
     let proxy_file = dir.path().join("proxies.txt");
+    let state_path = dir.path().join("state").join("pool-state.json");
     fs::write(
         &proxy_file,
         format!("http://127.0.0.1:{}\n", proxy_addr.port()),
@@ -620,8 +663,14 @@ async fn disabled_node_rechecks_even_when_health_precheck_is_disabled() -> io::R
         mihomo_enabled: false,
         ..AppConfig::default()
     };
-    let pool =
-        ProxyPool::with_runtime_failure_policy(vec![previous], 0, 1, Duration::from_millis(30), 1);
+    let pool = ProxyPool::with_runtime_failure_policy_and_state(
+        vec![previous],
+        0,
+        1,
+        Duration::from_millis(30),
+        1,
+        Some(state_path.clone()),
+    );
     let choice = pool.candidates().pop().unwrap();
     pool.report_failure(&choice);
     assert!(pool.candidates().is_empty());
@@ -635,6 +684,19 @@ async fn disabled_node_rechecks_even_when_health_precheck_is_disabled() -> io::R
     assert_eq!(summary.active, 1);
     assert_eq!(
         labels_from_pool(&pool),
+        vec![format!("http://127.0.0.1:{}", proxy_addr.port())]
+    );
+    let restarted = ProxyPool::with_runtime_failure_policy_and_state(
+        Vec::new(),
+        0,
+        1,
+        Duration::from_millis(30),
+        1,
+        Some(state_path),
+    );
+    assert!(restarted.disabled_proxies().is_empty());
+    assert_eq!(
+        labels_from_pool(&restarted),
         vec![format!("http://127.0.0.1:{}", proxy_addr.port())]
     );
     Ok(())

@@ -382,6 +382,7 @@ struct ProxyPoolInner {
     state: RwLock<PoolState>,
     selection: Mutex<SelectionBag>,
     state_path: Option<PathBuf>,
+    state_persistence: Mutex<()>,
     max_retries: usize,
     runtime_failure_threshold: usize,
     runtime_disable_after_cooldowns: usize,
@@ -581,6 +582,7 @@ impl ProxyPool {
                 }),
                 selection: Mutex::new(SelectionBag::default()),
                 state_path,
+                state_persistence: Mutex::new(()),
                 max_retries,
                 runtime_failure_threshold: runtime_failure_threshold.max(1),
                 runtime_disable_after_cooldowns: runtime_disable_after_cooldowns.max(1),
@@ -856,6 +858,14 @@ impl ProxyPool {
     }
 
     pub fn report_disabled_recheck_success(&self, key: &str) -> bool {
+        self.report_disabled_recheck_success_inner(key, true)
+    }
+
+    pub(crate) fn report_disabled_recheck_success_deferred(&self, key: &str) -> bool {
+        self.report_disabled_recheck_success_inner(key, false)
+    }
+
+    fn report_disabled_recheck_success_inner(&self, key: &str, persist: bool) -> bool {
         {
             let mut failures = self.failure_shard(key);
             let Some(record) = failures.get_mut(key) else {
@@ -871,12 +881,27 @@ impl ProxyPool {
             record.disabled_recheck_failures = 0;
             failures.remove(key);
         }
-        self.remove_persisted_disabled(key);
+        self.remove_persisted_disabled_inner(key, persist);
         self.reset_selection_to_current_generation();
         true
     }
 
     pub fn report_disabled_recheck_failure(&self, key: &str) -> DisabledRecheckFailure {
+        self.report_disabled_recheck_failure_inner(key, true)
+    }
+
+    pub(crate) fn report_disabled_recheck_failure_deferred(
+        &self,
+        key: &str,
+    ) -> DisabledRecheckFailure {
+        self.report_disabled_recheck_failure_inner(key, false)
+    }
+
+    fn report_disabled_recheck_failure_inner(
+        &self,
+        key: &str,
+        persist: bool,
+    ) -> DisabledRecheckFailure {
         let threshold = DEFAULT_DISABLED_RECHECK_DELETE_AFTER_FAILURES;
         let failures_count = {
             let mut failures = self.failure_shard(key);
@@ -894,13 +919,13 @@ impl ProxyPool {
             let mut failures = self.failure_shard(key);
             failures.remove(key);
             drop(failures);
-            self.remove_and_retire(key);
+            self.remove_and_retire(key, persist);
             DisabledRecheckFailure::Removed {
                 failures: failures_count,
                 threshold,
             }
         } else {
-            self.persist_disabled_entry(key, failures_count);
+            self.persist_disabled_entry_inner(key, failures_count, persist);
             DisabledRecheckFailure::StillDisabled {
                 failures: failures_count,
                 threshold,
@@ -1034,6 +1059,15 @@ impl ProxyPool {
     }
 
     fn persist_disabled_entry(&self, key: &str, disabled_recheck_failures: usize) {
+        self.persist_disabled_entry_inner(key, disabled_recheck_failures, true);
+    }
+
+    fn persist_disabled_entry_inner(
+        &self,
+        key: &str,
+        disabled_recheck_failures: usize,
+        persist: bool,
+    ) {
         {
             let mut guard = self.inner.state.write().expect("proxy pool lock poisoned");
             let key_hash = proxy_key_hash(key);
@@ -1045,21 +1079,34 @@ impl ProxyPool {
                 },
             );
         }
-        self.persist_state();
+        if persist {
+            self.persist_state();
+        }
     }
 
     fn remove_persisted_disabled(&self, key: &str) {
+        self.remove_persisted_disabled_inner(key, true);
+    }
+
+    fn remove_persisted_disabled_inner(&self, key: &str, persist: bool) {
         {
             let mut guard = self.inner.state.write().expect("proxy pool lock poisoned");
             guard.disabled_by_hash.remove(&proxy_key_hash(key));
         }
-        self.persist_state();
+        if persist {
+            self.persist_state();
+        }
     }
 
-    fn persist_state(&self) {
+    pub(crate) fn persist_state(&self) {
         let Some(path) = &self.inner.state_path else {
             return;
         };
+        let _persistence = self
+            .inner
+            .state_persistence
+            .lock()
+            .expect("proxy pool state persistence lock poisoned");
         let state = {
             let guard = self.inner.state.read().expect("proxy pool lock poisoned");
             PersistedPoolState {
@@ -1100,7 +1147,7 @@ impl ProxyPool {
         self.reset_selection(generation);
     }
 
-    fn remove_and_retire(&self, key: &str) {
+    fn remove_and_retire(&self, key: &str, persist: bool) {
         let generation = {
             let mut guard = self.inner.state.write().expect("proxy pool lock poisoned");
             let key_hash = proxy_key_hash(key);
@@ -1120,7 +1167,9 @@ impl ProxyPool {
             guard.generation
         };
         self.reset_selection(generation);
-        self.persist_state();
+        if persist {
+            self.persist_state();
+        }
     }
 }
 
@@ -1674,6 +1723,56 @@ mod tests {
         assert!(state.disabled.is_empty());
         assert!(state.retired.is_empty());
         assert_eq!(state.available.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_state_updates_are_atomically_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool-state.json");
+        let node_count = 16_u16;
+        let pool = ProxyPool::with_runtime_failure_policy_and_state(
+            (1..=node_count).map(http_proxy).collect(),
+            0,
+            1,
+            Duration::from_millis(30),
+            1,
+            Some(path.clone()),
+        );
+        for choice in pool.candidates() {
+            pool.report_failure(&choice);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(usize::from(node_count)));
+        let handles = (1..=node_count)
+            .map(|port| {
+                let barrier = Arc::clone(&barrier);
+                let pool = pool.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    assert!(matches!(
+                        pool.report_disabled_recheck_failure(&format!("http://127.0.0.1:{port}")),
+                        DisabledRecheckFailure::StillDisabled { failures: 1, .. }
+                    ));
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let state: PersistedPoolState = serde_json::from_str(&raw).unwrap();
+        let disabled = state
+            .disabled
+            .into_iter()
+            .map(|entry| (entry.key_hash, entry.disabled_recheck_failures))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(disabled.len(), usize::from(node_count));
+        for port in 1..=node_count {
+            let key_hash = proxy_key_hash(&format!("http://127.0.0.1:{port}"));
+            assert_eq!(disabled.get(&key_hash), Some(&1));
+        }
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]

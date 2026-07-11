@@ -52,12 +52,13 @@ health_check_attempts = 3
 health_check_timeout_ms = 10000
 
 # Maximum number of proxy nodes checked at the same time.
-# Large public proxy lists usually need 128-512 to avoid very slow startup.
+# Large public proxy lists usually need 128-512 to finish background refreshes
+# in a reasonable time.
 health_check_concurrency = 256
 
 # Maximum number of disabled nodes silently rechecked at the same time during
-# startup/refresh. Keep this lower than the main precheck concurrency when the
-# process has many disabled complex nodes or a small file-descriptor limit.
+# background startup/refresh. Keep this lower than the main precheck concurrency
+# when the process has many disabled complex nodes or a small file-descriptor limit.
 disabled_recheck_concurrency = 128
 
 # When health_check_url uses https://, keep certificate verification enabled by
